@@ -1,0 +1,49 @@
+from datetime import datetime, timezone
+
+from fastapi import APIRouter
+from sqlalchemy import distinct, func
+from sqlmodel import select
+
+from ..database import session_factory
+from ..models import PrReviewIteration
+
+
+router = APIRouter(prefix="/metrics", tags=["metrics"])
+
+
+@router.get("")
+async def get_metrics():
+    today = datetime.now(timezone.utc).date().isoformat()
+    async with session_factory() as session:
+        total_reviewed = (
+            await session.exec(
+                select(func.count(distinct(PrReviewIteration.pr_id))).where(
+                    PrReviewIteration.status == "REVIEWED"
+                )
+            )
+        ).one()
+        totals = (
+            await session.exec(
+                select(
+                    func.coalesce(func.sum(PrReviewIteration.tokens_used), 0),
+                    func.coalesce(
+                        func.sum(PrReviewIteration.estimated_cost_usd), 0.0
+                    ),
+                )
+            )
+        ).one()
+        daily_cost = (
+            await session.exec(
+                select(
+                    func.coalesce(
+                        func.sum(PrReviewIteration.estimated_cost_usd), 0.0
+                    )
+                ).where(func.date(PrReviewIteration.created_at) == today)
+            )
+        ).one()
+    return {
+        "total_prs_reviewed": int(total_reviewed),
+        "tokens_used": int(totals[0]),
+        "estimated_cost_usd": float(totals[1]),
+        "daily_cost_usd": float(daily_cost),
+    }

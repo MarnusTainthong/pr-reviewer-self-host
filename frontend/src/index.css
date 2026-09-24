@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply m-0 min-w-80 bg-canvas font-sans text-ink antialiased;
+  }
+
+  button,
+  input {
+    @apply outline-none;
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  a:focus-visible {
+    @apply ring-2 ring-accent ring-offset-2;
+  }
+}

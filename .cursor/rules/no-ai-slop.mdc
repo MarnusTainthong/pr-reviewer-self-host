@@ -1,0 +1,51 @@
+---
+description: Prevent AI slop when generating or editing this project
+alwaysApply: true
+---
+
+# No AI Slop
+
+Prefer less. If it is not required for the current request, do not add it.
+
+## Scope and structure
+
+- Do only what was asked. No bonus features, folders, or abstractions “for later”.
+- If the stack is unclear, ask before scaffolding. Do not invent a full stack.
+- Start as a single app. No monorepo (`apps/`, `packages/`) until there is a real need.
+- No empty files, barrel `index.ts` spam, placeholder tests, or dead `utils`/`helpers`/`common`.
+- No unsolicited CI, Docker, Makefile, LICENSE, CONTRIBUTING, or long README.
+
+## Dependencies
+
+- Add a library only when there is a concrete use case in code.
+- Prefer the stack’s built-ins over overlapping third-party packages.
+
+## Naming and code
+
+- Names must describe the real job. Avoid vague `Manager`, `Helper`, `Service`, `Util`.
+- No comments or JSDoc that restate the obvious.
+- No premature clean-architecture layers, custom exception trees, or wrappers for one call site.
+- Prefer deleting unused code over leaving TODOs and stubs that look complete.
+
+## Copy and tone
+
+- No marketing filler: seamless, robust, leverage, unlock, cutting-edge, delight, etc.
+- UI/docs copy stays short and specific. Not a landing-page pitch unless requested.
+
+## Emoji
+
+- Do not use emoji by default in UI, README, commits, comments, logs, or errors.
+- Use emoji only when branding or a platform convention truly requires it.
+
+## Color and UI
+
+- Do not default to purple/indigo gradients, glow, glassmorphism, or pill clusters.
+- Avoid the common AI looks: warm cream + terracotta serif, or dense broadsheet/newspaper layouts.
+- If no brand exists, use a simple 2–3 color palette. No multi-layer decorative gradients.
+- Dark mode is not the default unless requested.
+- Color and motion must serve hierarchy or usability—not decoration.
+- No card-heavy heroes, fake stats, badge spam, or emoji-as-polish.
+
+## When unsure
+
+- Ask, or ship the smaller version. Do not pad the project to look finished.

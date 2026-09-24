@@ -1,0 +1,270 @@
+import asyncio
+import base64
+import difflib
+import fnmatch
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from pathlib import PurePosixPath
+from typing import Any
+
+import httpx
+
+from .config import Settings
+
+
+class AzureDevOpsError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+@dataclass
+class PullRequestData:
+    pr_id: int
+    title: str
+    author_name: str
+    repository_id: str
+    repository_name: str
+    url: str
+    status: str
+    source_commit: str
+    target_commit: str
+
+
+EXCLUDED_PATHS = (
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "*.min.js",
+    "*.min.css",
+    "dist/*",
+    "node_modules/*",
+    "vendor/*",
+)
+
+
+class AzureDevOpsClient:
+    def __init__(self, settings: Settings) -> None:
+        token = base64.b64encode(f":{settings.azure_devops_pat}".encode()).decode()
+        self.base_url = (
+            f"https://dev.azure.com/{settings.azure_devops_organization}/"
+            f"{settings.azure_devops_project}/_apis/git"
+        )
+        self.reviewer = settings.azure_devops_reviewer.casefold()
+        self.max_changed_lines = settings.max_changed_lines
+        self.client = httpx.AsyncClient(
+            headers={"Authorization": f"Basic {token}"},
+            timeout=httpx.Timeout(30),
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        for attempt in range(4):
+            try:
+                response = await self.client.request(method, url, **kwargs)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if attempt == 3:
+                    raise AzureDevOpsError(str(exc), transient=True) from exc
+                await asyncio.sleep(2**attempt)
+                continue
+
+            if response.status_code < 400:
+                return response
+            transient = response.status_code == 429 or response.status_code >= 500
+            if not transient or attempt == 3:
+                raise AzureDevOpsError(
+                    f"Azure DevOps returned {response.status_code}: "
+                    f"{response.text[:500]}",
+                    transient=transient,
+                )
+            await asyncio.sleep(self._retry_delay(response, attempt))
+        raise AzureDevOpsError("Azure DevOps request failed", transient=True)
+
+    @staticmethod
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        value = response.headers.get("Retry-After")
+        if value:
+            try:
+                return max(0.0, float(value))
+            except ValueError:
+                try:
+                    return max(
+                        0.0,
+                        (parsedate_to_datetime(value) - parsedate_to_datetime(
+                            response.headers["Date"]
+                        )).total_seconds(),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+        return float(2**attempt)
+
+    async def list_assigned_active_prs(self) -> list[PullRequestData]:
+        response = await self._request(
+            "GET",
+            f"{self.base_url}/pullrequests",
+            params={"searchCriteria.status": "active", "api-version": "7.1"},
+        )
+        results = []
+        for raw in response.json().get("value", []):
+            if any(self._reviewer_matches(item) for item in raw.get("reviewers", [])):
+                results.append(self._parse_pr(raw))
+        return results
+
+    async def get_pr(self, repository_id: str, pr_id: int) -> PullRequestData:
+        response = await self._request(
+            "GET",
+            f"{self.base_url}/repositories/{repository_id}/pullRequests/{pr_id}",
+            params={"api-version": "7.1"},
+        )
+        return self._parse_pr(response.json())
+
+    def _reviewer_matches(self, reviewer: dict[str, Any]) -> bool:
+        candidates = (
+            reviewer.get("id", ""),
+            reviewer.get("displayName", ""),
+            reviewer.get("uniqueName", ""),
+        )
+        return self.reviewer in {str(candidate).casefold() for candidate in candidates}
+
+    @staticmethod
+    def _parse_pr(raw: dict[str, Any]) -> PullRequestData:
+        repository = raw["repository"]
+        return PullRequestData(
+            pr_id=raw["pullRequestId"],
+            title=raw["title"],
+            author_name=raw["createdBy"]["displayName"],
+            repository_id=repository["id"],
+            repository_name=repository["name"],
+            url=raw.get("_links", {}).get("web", {}).get("href", raw["url"]),
+            status=raw["status"].casefold(),
+            source_commit=raw["lastMergeSourceCommit"]["commitId"],
+            target_commit=raw["lastMergeTargetCommit"]["commitId"],
+        )
+
+    async def build_diff(self, pr: PullRequestData) -> tuple[str, int]:
+        changes_response = await self._request(
+            "GET",
+            f"{self.base_url}/repositories/{pr.repository_id}/diffs/commits",
+            params={
+                "baseVersion": pr.target_commit,
+                "baseVersionType": "commit",
+                "targetVersion": pr.source_commit,
+                "targetVersionType": "commit",
+                "$top": 2000,
+                "api-version": "7.1",
+            },
+        )
+
+        changes_data = changes_response.json()
+        if changes_data.get("allChangesIncluded") is False:
+            return "", self.max_changed_lines + 1
+
+        patches: list[str] = []
+        changed_lines = 0
+        for change in changes_data.get("changes", []):
+            path = change.get("item", {}).get("path", "").lstrip("/")
+            if not path or self._excluded(path):
+                continue
+            change_type = str(change.get("changeType", "")).casefold()
+            old_text = (
+                ""
+                if "add" in change_type
+                else await self._get_text(pr.repository_id, path, pr.target_commit)
+            )
+            new_text = (
+                ""
+                if "delete" in change_type
+                else await self._get_text(pr.repository_id, path, pr.source_commit)
+            )
+            if old_text is None or new_text is None:
+                continue
+            patch = list(
+                difflib.unified_diff(
+                    old_text.splitlines(),
+                    new_text.splitlines(),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                    lineterm="",
+                )
+            )
+            if patch:
+                changed_lines += sum(
+                    1
+                    for line in patch
+                    if (line.startswith("+") or line.startswith("-"))
+                    and not line.startswith(("+++", "---"))
+                )
+                patches.append("\n".join(patch))
+        return "\n\n".join(patches), changed_lines
+
+    async def _get_text(
+        self, repository_id: str, path: str, commit_id: str
+    ) -> str | None:
+        response = await self._request(
+            "GET",
+            f"{self.base_url}/repositories/{repository_id}/items",
+            params={
+                "path": f"/{path}",
+                "versionDescriptor.version": commit_id,
+                "versionDescriptor.versionType": "commit",
+                "includeContent": "true",
+                "api-version": "7.1",
+            },
+        )
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = response.json()
+            content = data.get("content")
+            return content if isinstance(content, str) else None
+        try:
+            return response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    @staticmethod
+    def _excluded(path: str) -> bool:
+        normalized = str(PurePosixPath(path))
+        return any(
+            fnmatch.fnmatch(normalized, pattern)
+            or fnmatch.fnmatch(PurePosixPath(normalized).name, pattern)
+            for pattern in EXCLUDED_PATHS
+        )
+
+    async def post_comment(
+        self,
+        pr: PullRequestData,
+        file_path: str,
+        line: int,
+        severity: str,
+        comment: str,
+    ) -> None:
+        body = {
+            "comments": [
+                {
+                    "parentCommentId": 0,
+                    "content": f"**AI review — {severity}**\n\n{comment}",
+                    "commentType": 1,
+                }
+            ],
+            "status": 1,
+            "threadContext": {
+                "filePath": f"/{file_path.lstrip('/')}",
+                "rightFileStart": {"line": line, "offset": 1},
+                "rightFileEnd": {"line": line, "offset": 1},
+            },
+            "properties": {
+                "Microsoft.TeamFoundation.Discussion.SupportsMarkdown": {
+                    "type": "System.Int32",
+                    "value": 1,
+                }
+            },
+        }
+        await self._request(
+            "POST",
+            f"{self.base_url}/repositories/{pr.repository_id}/pullRequests/"
+            f"{pr.pr_id}/threads",
+            params={"api-version": "7.1"},
+            json=body,
+        )
