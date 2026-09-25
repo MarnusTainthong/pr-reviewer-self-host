@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import select
 
 from ..database import session_factory
+from ..llm import LlmClient, LlmConfig, LlmError
 from ..models import LlmModel, utc_now
 
 
@@ -46,6 +47,17 @@ def _serialize(model: LlmModel) -> dict:
         "created_at": model.created_at,
         "updated_at": model.updated_at,
     }
+
+
+def _to_llm_config(model: LlmModel) -> LlmConfig:
+    return LlmConfig(
+        name=model.name,
+        base_url=model.base_url.rstrip("/"),
+        api_key=model.api_key,
+        model=model.model,
+        input_cost_per_million=model.input_cost_per_million,
+        output_cost_per_million=model.output_cost_per_million,
+    )
 
 
 @router.get("")
@@ -110,6 +122,31 @@ async def activate_model(model_id: int):
         await session.commit()
         await session.refresh(model)
     return _serialize(model)
+
+
+@router.post("/{model_id}/test")
+async def test_model(model_id: int):
+    async with session_factory() as session:
+        model = await session.get(LlmModel, model_id)
+        if model is None:
+            raise HTTPException(status_code=404, detail="Model not found")
+        config = _to_llm_config(model)
+
+    client = LlmClient()
+    try:
+        result = await client.test_connection(config)
+    except LlmError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Connection test failed: {exc}",
+        ) from exc
+    finally:
+        await client.close()
+
+    return {
+        "response_time_ms": result.response_time_ms,
+        "response_preview": result.response_preview,
+    }
 
 
 @router.delete("/{model_id}", status_code=status.HTTP_204_NO_CONTENT)

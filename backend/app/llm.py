@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -155,6 +156,12 @@ class LlmResponse:
     estimated_cost_usd: float
 
 
+@dataclass
+class ConnectionTestResult:
+    response_time_ms: int
+    response_preview: str
+
+
 class LlmError(Exception):
     def __init__(self, message: str, transient: bool) -> None:
         super().__init__(message)
@@ -260,6 +267,35 @@ class LlmClient:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    async def test_connection(self, config: LlmConfig) -> ConnectionTestResult:
+        started_at = perf_counter()
+        response = await self._post_with_backoff(
+            config,
+            {
+                "model": config.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Reply with exactly: OK",
+                    }
+                ],
+                "max_completion_tokens": 16,
+            },
+        )
+        try:
+            data = response.json()
+            message = data["choices"][0]["message"]
+            preview = _message_text(message)[:100]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise LlmError(
+                "Model returned an invalid chat-completions response",
+                transient=False,
+            ) from exc
+        return ConnectionTestResult(
+            response_time_ms=round((perf_counter() - started_at) * 1000),
+            response_preview=preview or "Response received",
+        )
 
     async def review(self, diff: str, config: LlmConfig | None = None) -> LlmResponse:
         active = config or await get_active_llm_config()

@@ -49,6 +49,11 @@ type LlmModelItem = {
   updated_at: string;
 };
 
+type ModelTestResult = {
+  response_time_ms: number;
+  response_preview: string;
+};
+
 type ReviewRuleItem = {
   id: number;
   title: string;
@@ -471,6 +476,10 @@ function ModelsPage({
   const [models, setModels] = useState<LlmModelItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [testingId, setTestingId] = useState<number | null>(null);
+  const [testResults, setTestResults] = useState<
+    Record<number, { success: boolean; message: string }>
+  >({});
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState(emptyModelForm);
 
@@ -540,6 +549,40 @@ function ModelsPage({
     }
   };
 
+  const testModel = async (model: LlmModelItem) => {
+    setTestingId(model.id);
+    setTestResults((current) => {
+      const next = { ...current };
+      delete next[model.id];
+      return next;
+    });
+    try {
+      const result = await request<ModelTestResult>(`/models/${model.id}/test`, {
+        method: "POST",
+      });
+      setTestResults((current) => ({
+        ...current,
+        [model.id]: {
+          success: true,
+          message: `Connected in ${result.response_time_ms} ms · ${result.response_preview}`,
+        },
+      }));
+    } catch (testError) {
+      setTestResults((current) => ({
+        ...current,
+        [model.id]: {
+          success: false,
+          message:
+            testError instanceof Error
+              ? testError.message
+              : "Connection test failed",
+        },
+      }));
+    } finally {
+      setTestingId(null);
+    }
+  };
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
       <div className="mb-6">
@@ -581,8 +624,26 @@ function ModelsPage({
                   <p className="mt-2 text-xs text-slate-500">
                     Key {model.api_key_masked}
                   </p>
+                  {testResults[model.id] && (
+                    <p
+                      className={`mt-2 break-words text-xs ${
+                        testResults[model.id].success
+                          ? "text-emerald-700"
+                          : "text-red-700"
+                      }`}
+                    >
+                      {testResults[model.id].message}
+                    </p>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  <button
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    disabled={testingId !== null}
+                    onClick={() => void testModel(model)}
+                  >
+                    {testingId === model.id ? "Testing…" : "Test connection"}
+                  </button>
                   {!model.is_active && (
                     <button
                       className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-800"
