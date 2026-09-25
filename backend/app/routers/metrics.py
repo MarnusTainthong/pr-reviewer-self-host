@@ -1,5 +1,3 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from sqlalchemy import distinct, func
@@ -19,7 +17,6 @@ class AutoReviewBody(BaseModel):
 
 @router.get("")
 async def get_metrics():
-    today = datetime.now(timezone.utc).date().isoformat()
     async with session_factory() as session:
         total_reviewed = (
             await session.exec(
@@ -28,33 +25,11 @@ async def get_metrics():
                 )
             )
         ).one()
-        totals = (
-            await session.exec(
-                select(
-                    func.coalesce(func.sum(PrReviewIteration.tokens_used), 0),
-                    func.coalesce(
-                        func.sum(PrReviewIteration.estimated_cost_usd), 0.0
-                    ),
-                )
-            )
-        ).one()
-        daily_cost = (
-            await session.exec(
-                select(
-                    func.coalesce(
-                        func.sum(PrReviewIteration.estimated_cost_usd), 0.0
-                    )
-                ).where(func.date(PrReviewIteration.created_at) == today)
-            )
-        ).one()
         active_model = (
             await session.exec(select(LlmModel).where(LlmModel.is_active == True))  # noqa: E712
         ).one_or_none()
     return {
         "total_prs_reviewed": int(total_reviewed),
-        "tokens_used": int(totals[0]),
-        "estimated_cost_usd": float(totals[1]),
-        "daily_cost_usd": float(daily_cost),
         "auto_pr_review_enabled": get_settings().auto_pr_review_enabled,
         "active_model_name": active_model.name if active_model else None,
         "active_model_id": active_model.model if active_model else None,

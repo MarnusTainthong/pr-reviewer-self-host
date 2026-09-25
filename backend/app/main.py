@@ -11,6 +11,7 @@ from .database import engine, init_database
 from .routers.metrics import router as metrics_router
 from .routers.models import router as models_router
 from .routers.prs import router as prs_router
+from .routers.rules import router as rules_router
 from .scheduler import ReviewScheduler
 
 
@@ -45,6 +46,9 @@ app.include_router(
 )
 app.include_router(
     models_router, prefix="/api", dependencies=[Depends(require_auth)]
+)
+app.include_router(
+    rules_router, prefix="/api", dependencies=[Depends(require_auth)]
 )
 
 

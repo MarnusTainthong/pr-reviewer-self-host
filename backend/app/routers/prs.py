@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -7,7 +6,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from ..database import session_factory
-from ..models import PrReviewIteration, PullRequest
+from ..models import PullRequest
 
 
 logger = logging.getLogger(__name__)
@@ -111,13 +110,6 @@ async def get_pull_request(pr_id: int):
     }
 
 
-async def _run_manual_review(review_scheduler, pr_id: int) -> None:
-    try:
-        await review_scheduler.manual_review(pr_id)
-    except Exception:
-        logger.exception("Manual review failed for PR %s", pr_id)
-
-
 @router.post("/fetch")
 async def fetch_pull_requests(request: Request):
     try:
@@ -129,7 +121,7 @@ async def fetch_pull_requests(request: Request):
             detail=str(exc) or "Azure DevOps fetch failed",
         ) from exc
     return {
-        "message": "Fetch from Azure DevOps completed; reviews queued",
+        "message": "Fetch from Azure DevOps completed",
         "fetched": count,
     }
 
@@ -139,5 +131,18 @@ async def re_review(pr_id: int, request: Request):
     async with session_factory() as session:
         if await session.get(PullRequest, pr_id) is None:
             raise HTTPException(status_code=404, detail="Pull request not found")
-    asyncio.create_task(_run_manual_review(request.app.state.review_scheduler, pr_id))
-    return {"message": "Re-review queued", "pr_id": pr_id}
+    try:
+        commit_id = await request.app.state.review_scheduler.manual_review(pr_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unable to queue re-review for PR %s", pr_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc) or "Unable to queue re-review",
+        ) from exc
+    return {
+        "message": "Re-review queued",
+        "pr_id": pr_id,
+        "commit_id": commit_id,
+    }

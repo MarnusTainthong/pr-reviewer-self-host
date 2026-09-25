@@ -43,6 +43,17 @@ class LlmModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class ReviewRule(SQLModel, table=True):
+    __tablename__ = "review_rules"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1)
+    is_enabled: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class PrReviewIteration(SQLModel, table=True):
     __tablename__ = "pr_review_iterations"
     __table_args__ = (

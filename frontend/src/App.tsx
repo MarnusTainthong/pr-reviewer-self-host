@@ -8,8 +8,6 @@ type Iteration = {
   status: string;
   ai_summary: string | null;
   raw_ai_response: string | null;
-  tokens_used: number;
-  estimated_cost_usd: number;
   error_message: string | null;
   error_type: string | null;
   created_at: string;
@@ -35,9 +33,6 @@ type PullRequestDetail = Omit<PullRequest, "latest_iteration"> & {
 
 type Metrics = {
   total_prs_reviewed: number;
-  tokens_used: number;
-  estimated_cost_usd: number;
-  daily_cost_usd: number;
   auto_pr_review_enabled: boolean;
   active_model_name: string | null;
   active_model_id: string | null;
@@ -49,22 +44,56 @@ type LlmModelItem = {
   base_url: string;
   api_key_masked: string;
   model: string;
-  input_cost_per_million: number;
-  output_cost_per_million: number;
   is_active: boolean;
   created_at: string;
   updated_at: string;
 };
 
+type ReviewRuleItem = {
+  id: number;
+  title: string;
+  body: string;
+  is_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+type FindingCategory =
+  | "security"
+  | "logic"
+  | "bug"
+  | "performance"
+  | "api"
+  | "reliability"
+  | "data"
+  | "test"
+  | "readability"
+  | "other";
+
 type Finding = {
   file: string;
   line: number;
   severity: "critical" | "suggestion" | "nit";
+  category?: FindingCategory;
   comment: string;
 };
 
+function parseDate(value: string) {
+  const normalized = value.includes("T")
+    ? value
+    : value.replace(" ", "T");
+  const withZone =
+    /([zZ]|[+-]\d{2}:?\d{2})$/.test(normalized) || normalized.endsWith("Z")
+      ? normalized
+      : `${normalized}Z`;
+  const date = new Date(withZone);
+  return Number.isNaN(date.getTime()) ? new Date(value) : date;
+}
+
 function formatDate(value: string | null) {
   if (!value) return "—";
+  const date = parseDate(value);
+  if (Number.isNaN(date.getTime())) return "—";
   return new Intl.DateTimeFormat(undefined, {
     year: "numeric",
     month: "short",
@@ -72,20 +101,22 @@ function formatDate(value: string | null) {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-  }).format(new Date(value));
+  }).format(date);
 }
 
 function formatMonthLabel(value: string | null) {
   if (!value) return "Unknown date";
+  const date = parseDate(value);
+  if (Number.isNaN(date.getTime())) return "Unknown date";
   return new Intl.DateTimeFormat(undefined, {
     month: "long",
     year: "numeric",
-  }).format(new Date(value));
+  }).format(date);
 }
 
 function monthSortKey(value: string | null) {
   if (!value) return "0000-00";
-  const date = new Date(value);
+  const date = parseDate(value);
   if (Number.isNaN(date.getTime())) return "0000-00";
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }
@@ -122,6 +153,57 @@ function Status({ value }: { value: string }) {
       className={`inline-flex items-center rounded-md px-2 py-1 text-[11px] font-semibold tracking-wide ring-1 ring-inset ${colors[value] ?? colors.PENDING}`}
     >
       {value}
+    </span>
+  );
+}
+
+const severityMeta: Record<
+  Finding["severity"],
+  { emoji: string; badge: string; tip: string }
+> = {
+  critical: {
+    emoji: "🔴",
+    badge: "bg-red-100 text-red-800 ring-red-700/20",
+    tip: "Critical — bug, security, or data-loss risk. Fix before merge.",
+  },
+  suggestion: {
+    emoji: "🟡",
+    badge: "bg-amber-100 text-amber-900 ring-amber-700/20",
+    tip: "Suggestion — worthwhile improvement, not a blocker.",
+  },
+  nit: {
+    emoji: "⚪",
+    badge: "bg-slate-100 text-slate-700 ring-slate-600/15",
+    tip: "Nit — small style or clarity note. Optional.",
+  },
+};
+
+function SeverityBadge({ severity }: { severity: Finding["severity"] }) {
+  const meta = severityMeta[severity] ?? severityMeta.nit;
+  return (
+    <span className="group relative inline-flex">
+      <span
+        className={`inline-flex cursor-help items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 ring-inset ${meta.badge}`}
+        title={meta.tip}
+        tabIndex={0}
+      >
+        <span aria-hidden="true">{meta.emoji}</span>
+        {severity}
+      </span>
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 w-max max-w-56 -translate-x-1/2 rounded-md bg-slate-900 px-2.5 py-1.5 text-left text-[11px] font-medium normal-case tracking-normal text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100"
+      >
+        {meta.tip}
+      </span>
+    </span>
+  );
+}
+
+function CategoryBadge({ category }: { category: FindingCategory }) {
+  return (
+    <span className="inline-flex items-center rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700 ring-1 ring-inset ring-slate-600/10">
+      {category}
     </span>
   );
 }
@@ -185,12 +267,22 @@ function ReviewDetail({
   onClose,
   onRereview,
   queueing,
+  reviewing,
+  error,
 }: {
   detail: PullRequestDetail;
   onClose: () => void;
   onRereview: () => void;
   queueing: boolean;
+  reviewing: boolean;
+  error: string;
 }) {
+  const latest = detail.iterations[0];
+  const inProgress =
+    reviewing ||
+    latest?.status === "PENDING" ||
+    latest?.status === "ATTEMPTING";
+  const busy = queueing || inProgress;
   return (
     <div className="fixed inset-0 z-10 flex justify-end bg-slate-950/50 backdrop-blur-[2px]">
       <button
@@ -230,12 +322,40 @@ function ReviewDetail({
           </a>
           <button
             className="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-teal-800 disabled:opacity-50"
-            disabled={queueing}
+            disabled={busy}
             onClick={onRereview}
           >
-            {queueing ? "Queueing…" : "Re-review current commit"}
+            {queueing
+              ? "Queueing…"
+              : inProgress
+                ? "Reviewing…"
+                : "Re-review"}
           </button>
         </div>
+        {latest && (
+          <p className="mt-3 font-mono text-xs text-slate-500">
+            Latest commit {latest.last_commit_id.slice(0, 12)} · {latest.status}
+          </p>
+        )}
+        {inProgress && (
+          <div className="mt-4 flex items-center gap-3 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+            <span
+              className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-sky-300 border-t-sky-700"
+              aria-hidden
+            />
+            <div>
+              <p className="font-semibold">AI review in progress</p>
+              <p className="mt-0.5 text-sky-800">
+                Waiting for the model to finish. This panel refreshes automatically.
+              </p>
+            </div>
+          </div>
+        )}
+        {error && (
+          <p className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            {error}
+          </p>
+        )}
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-7 sm:px-8">
@@ -259,12 +379,12 @@ function ReviewDetail({
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <Status value={iteration.status} />
-                  <time className="text-xs text-slate-500">
+                  <time className="font-mono text-xs tabular-nums text-slate-500">
                     {formatDate(iteration.reviewed_at ?? iteration.created_at)}
                   </time>
                 </div>
                 <p className="mt-3 break-all font-mono text-xs text-slate-500">
-                  {iteration.last_commit_id.slice(0, 12)}
+                  Commit {iteration.last_commit_id.slice(0, 12)}
                 </p>
                 {iteration.ai_summary && (
                   <p className="mt-2 break-words text-sm">{iteration.ai_summary}</p>
@@ -283,29 +403,46 @@ function ReviewDetail({
                 )}
                 {findings.length > 0 && (
                   <div className="mt-4 space-y-3">
-                    {findings.map((finding, index) => (
-                      <div
-                        key={`${finding.file}-${finding.line}-${index}`}
-                        className="min-w-0 overflow-hidden rounded-lg border border-slate-100 bg-slate-50 p-3.5 text-sm"
-                      >
-                        <div className="flex flex-wrap gap-2 font-mono text-xs">
-                          <span className="font-semibold uppercase text-accent">
-                            {finding.severity}
-                          </span>
-                          <span className="min-w-0 break-all">
-                            {finding.file}:{finding.line}
-                          </span>
+                    {findings.map((finding, index) => {
+                      const location = `${finding.file}:${finding.line}`;
+                      const shortFile =
+                        finding.file.split("/").pop() ?? finding.file;
+                      return (
+                        <div
+                          key={`${finding.file}-${finding.line}-${index}`}
+                          className="min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3.5 text-sm shadow-sm"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <SeverityBadge severity={finding.severity} />
+                            <CategoryBadge
+                              category={finding.category ?? "other"}
+                            />
+                            <span className="group relative inline-flex min-w-0 max-w-full">
+                              <span
+                                className="cursor-help truncate rounded-md bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-600 ring-1 ring-inset ring-slate-600/10"
+                                title={location}
+                                tabIndex={0}
+                              >
+                                {shortFile}:{finding.line}
+                              </span>
+                              <span
+                                role="tooltip"
+                                className="pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-max max-w-xs break-all rounded-md bg-slate-900 px-2.5 py-1.5 text-left text-[11px] font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100"
+                              >
+                                {location}
+                              </span>
+                            </span>
+                          </div>
+                          <p className="mt-2.5 break-words whitespace-pre-wrap leading-6 text-slate-800">
+                            {finding.comment}
+                          </p>
                         </div>
-                        <p className="mt-2 break-words whitespace-pre-wrap">
-                          {finding.comment}
-                        </p>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
                 <p className="mt-3 text-xs text-slate-500">
-                  {iteration.tokens_used.toLocaleString()} tokens · $
-                  {iteration.estimated_cost_usd.toFixed(4)}
+                  Reviewed {formatDate(iteration.reviewed_at ?? iteration.created_at)}
                 </p>
               </section>
             );
@@ -322,8 +459,6 @@ const emptyModelForm = {
   base_url: "https://api.openai.com/v1",
   api_key: "",
   model: "",
-  input_cost_per_million: "0.15",
-  output_cost_per_million: "0.60",
 };
 
 function ModelsPage({
@@ -367,8 +502,6 @@ function ModelsPage({
       base_url: model.base_url,
       api_key: "",
       model: model.model,
-      input_cost_per_million: String(model.input_cost_per_million),
-      output_cost_per_million: String(model.output_cost_per_million),
     });
   };
 
@@ -381,8 +514,8 @@ function ModelsPage({
         name: form.name.trim(),
         base_url: form.base_url.trim(),
         model: form.model.trim(),
-        input_cost_per_million: Number(form.input_cost_per_million),
-        output_cost_per_million: Number(form.output_cost_per_million),
+        input_cost_per_million: 0,
+        output_cost_per_million: 0,
       };
       if (editingId == null) {
         await request("/models", {
@@ -446,9 +579,7 @@ function ModelsPage({
                     {model.base_url}
                   </p>
                   <p className="mt-2 text-xs text-slate-500">
-                    Key {model.api_key_masked} · $
-                    {model.input_cost_per_million}/$
-                    {model.output_cost_per_million} per 1M tokens
+                    Key {model.api_key_masked}
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -521,8 +652,6 @@ function ModelsPage({
               ["base_url", "Base URL", "https://api.xiaomimimo.com/v1"],
               ["model", "Model id", "mimo-v2.6-pro"],
               ["api_key", editingId ? "API key (leave blank to keep)" : "API key", "sk-..."],
-              ["input_cost_per_million", "Input $ / 1M tokens", "0.15"],
-              ["output_cost_per_million", "Output $ / 1M tokens", "0.60"],
             ].map(([key, label, placeholder]) => (
               <label key={key} className="block text-sm">
                 <span className="font-medium text-slate-700">{label}</span>
@@ -565,6 +694,362 @@ function ModelsPage({
   );
 }
 
+const emptyRuleForm = {
+  title: "",
+  body: "",
+  is_enabled: true,
+};
+
+function RulesPage({
+  request,
+  onError,
+}: {
+  request: <T,>(path: string, options?: RequestInit) => Promise<T>;
+  onError: (message: string) => void;
+}) {
+  const [rules, setRules] = useState<ReviewRuleItem[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [form, setForm] = useState(emptyRuleForm);
+
+  const loadRules = useCallback(async () => {
+    setLoading(true);
+    try {
+      const result = await request<{ items: ReviewRuleItem[] }>("/rules");
+      setRules(result.items);
+      setSelectedIds((current) => {
+        const next = new Set<number>();
+        for (const rule of result.items) {
+          if (current.has(rule.id)) next.add(rule.id);
+        }
+        return next;
+      });
+    } catch (loadError) {
+      onError(loadError instanceof Error ? loadError.message : "Unable to load rules");
+    } finally {
+      setLoading(false);
+    }
+  }, [onError, request]);
+
+  useEffect(() => {
+    void loadRules();
+  }, [loadRules]);
+
+  const resetForm = () => {
+    setEditingId(null);
+    setForm(emptyRuleForm);
+  };
+
+  const startEdit = (rule: ReviewRuleItem) => {
+    setEditingId(rule.id);
+    setForm({
+      title: rule.title,
+      body: rule.body,
+      is_enabled: rule.is_enabled,
+    });
+  };
+
+  const allSelected = rules.length > 0 && selectedIds.size === rules.length;
+
+  const toggleSelected = (ruleId: number) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(ruleId)) next.delete(ruleId);
+      else next.add(ruleId);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedIds(new Set());
+      return;
+    }
+    setSelectedIds(new Set(rules.map((rule) => rule.id)));
+  };
+
+  const exportRules = (items: ReviewRuleItem[]) => {
+    if (items.length === 0) {
+      onError("Select at least one rule to export");
+      return;
+    }
+    onError("");
+    const payload = {
+      exported_at: new Date().toISOString(),
+      rules: items.map((rule) => ({
+        title: rule.title,
+        body: rule.body,
+        is_enabled: rule.is_enabled,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `review-rules-${stamp}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const saveRule = async (event: FormEvent) => {
+    event.preventDefault();
+    setSaving(true);
+    onError("");
+    try {
+      const payload = {
+        title: form.title.trim(),
+        body: form.body.trim(),
+        is_enabled: form.is_enabled,
+      };
+      if (editingId == null) {
+        await request("/rules", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+      } else {
+        await request(`/rules/${editingId}`, {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        });
+      }
+      resetForm();
+      await loadRules();
+    } catch (saveError) {
+      onError(saveError instanceof Error ? saveError.message : "Unable to save rule");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-accent">Settings</p>
+          <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">
+            Review rules
+          </h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Enabled rules are added to the reviewer prompt for every PR review.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
+            disabled={rules.length === 0}
+            onClick={() => exportRules(rules)}
+          >
+            Export all
+          </button>
+          <button
+            type="button"
+            className="rounded-lg bg-accent px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+            disabled={selectedIds.size === 0}
+            onClick={() =>
+              exportRules(rules.filter((rule) => selectedIds.has(rule.id)))
+            }
+          >
+            Export selected ({selectedIds.size})
+          </button>
+        </div>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+        <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <h3 className="font-semibold text-slate-950">Configured rules</h3>
+              {!loading && rules.length > 0 && (
+                <label className="flex items-center gap-2 text-sm text-slate-600">
+                  <input
+                    type="checkbox"
+                    className="rounded border-slate-300 text-accent focus:ring-accent"
+                    checked={allSelected}
+                    onChange={toggleSelectAll}
+                  />
+                  Select all
+                </label>
+              )}
+            </div>
+            {!loading && (
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-slate-200/80">
+                {rules.length.toLocaleString()} rule
+                {rules.length === 1 ? "" : "s"}
+              </span>
+            )}
+          </div>
+          <div className="divide-y divide-slate-100">
+            {rules.map((rule, index) => (
+              <div
+                key={rule.id}
+                className="flex flex-wrap items-start justify-between gap-4 px-5 py-4"
+              >
+                <div className="flex min-w-0 flex-1 gap-3">
+                  <input
+                    type="checkbox"
+                    className="mt-1.5 rounded border-slate-300 text-accent focus:ring-accent"
+                    checked={selectedIds.has(rule.id)}
+                    onChange={() => toggleSelected(rule.id)}
+                    aria-label={`Select ${rule.title}`}
+                  />
+                  <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-slate-100 font-mono text-xs font-semibold tabular-nums text-slate-600">
+                    {index + 1}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="font-semibold text-slate-950">{rule.title}</p>
+                    <span
+                      className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                        rule.is_enabled
+                          ? "bg-emerald-100 text-emerald-800"
+                          : "bg-slate-100 text-slate-600"
+                      }`}
+                    >
+                      {rule.is_enabled ? "Enabled" : "Disabled"}
+                    </span>
+                  </div>
+                  <p className="mt-2 whitespace-pre-wrap break-words text-sm text-slate-600">
+                    {rule.body}
+                  </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    onClick={() =>
+                      void request(`/rules/${rule.id}/toggle`, {
+                        method: "POST",
+                      })
+                        .then(loadRules)
+                        .catch((toggleError) =>
+                          onError(
+                            toggleError instanceof Error
+                              ? toggleError.message
+                              : "Unable to toggle",
+                          ),
+                        )
+                    }
+                  >
+                    {rule.is_enabled ? "Disable" : "Enable"}
+                  </button>
+                  <button
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    onClick={() => startEdit(rule)}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50"
+                    onClick={() =>
+                      void request(`/rules/${rule.id}`, { method: "DELETE" })
+                        .then(() => {
+                          if (editingId === rule.id) resetForm();
+                          return loadRules();
+                        })
+                        .catch((deleteError) =>
+                          onError(
+                            deleteError instanceof Error
+                              ? deleteError.message
+                              : "Unable to delete",
+                          ),
+                        )
+                    }
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+            {!loading && rules.length === 0 && (
+              <p className="p-8 text-center text-sm text-slate-500">
+                No rules yet. Add project-specific guidance for reviews.
+              </p>
+            )}
+            {loading && (
+              <p className="p-8 text-center text-sm text-slate-500">Loading…</p>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h3 className="font-semibold text-slate-950">
+            {editingId == null ? "Add rule" : "Edit rule"}
+          </h3>
+          <form className="mt-4 space-y-3" onSubmit={(event) => void saveRule(event)}>
+            <label className="block text-sm">
+              <span className="font-medium text-slate-700">Title</span>
+              <input
+                className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-accent"
+                placeholder="Prefer early returns"
+                value={form.title}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    title: event.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+            <label className="block text-sm">
+              <span className="font-medium text-slate-700">Rule</span>
+              <textarea
+                className="mt-1.5 min-h-32 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-accent"
+                placeholder="Flag deeply nested conditionals when an early return would be clearer."
+                value={form.body}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    body: event.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                className="rounded border-slate-300 text-accent focus:ring-accent"
+                checked={form.is_enabled}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    is_enabled: event.target.checked,
+                  }))
+                }
+              />
+              Enabled for reviews
+            </label>
+            <div className="flex gap-2 pt-2">
+              <button
+                className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                disabled={saving}
+              >
+                {saving ? "Saving…" : editingId == null ? "Add rule" : "Save changes"}
+              </button>
+              {editingId != null && (
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  onClick={resetForm}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          </form>
+        </section>
+      </div>
+    </div>
+  );
+}
+
 const PAGE_SIZE_OPTIONS = [20, 40, 60, 100] as const;
 
 export default function App() {
@@ -579,10 +1064,11 @@ export default function App() {
   const [detail, setDetail] = useState<PullRequestDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [queueing, setQueueing] = useState(false);
+  const [reviewingPrId, setReviewingPrId] = useState<number | null>(null);
   const [togglingAuto, setTogglingAuto] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState("");
-  const [view, setView] = useState<"dashboard" | "models">("dashboard");
+  const [view, setView] = useState<"dashboard" | "models" | "rules">("dashboard");
 
   const request = useCallback(
     async <T,>(path: string, options?: RequestInit): Promise<T> => {
@@ -647,6 +1133,9 @@ export default function App() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const rangeStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const rangeEnd = Math.min(page * pageSize, total);
+  const prRecordNumbers = new Map(
+    prs.map((pr, index) => [pr.pr_id, (page - 1) * pageSize + index + 1]),
+  );
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -660,6 +1149,49 @@ export default function App() {
       setError(loadError instanceof Error ? loadError.message : "Unable to load");
     }
   };
+
+  const refreshDetail = useCallback(
+    async (prId: number) => {
+      const next = await request<PullRequestDetail>(`/prs/${prId}`);
+      setDetail(next);
+      return next;
+    },
+    [request],
+  );
+
+  const detailStatus = detail?.iterations[0]?.status;
+  const pollingPrId =
+    reviewingPrId ??
+    (detail &&
+    detailStatus &&
+    ["PENDING", "ATTEMPTING"].includes(detailStatus)
+      ? detail.pr_id
+      : null);
+
+  useEffect(() => {
+    if (pollingPrId == null) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const next = await refreshDetail(pollingPrId);
+        const nextStatus = next.iterations[0]?.status;
+        if (nextStatus && !["PENDING", "ATTEMPTING"].includes(nextStatus)) {
+          if (!cancelled) {
+            setReviewingPrId(null);
+            void loadDashboard();
+          }
+        }
+      } catch {
+        // Keep polling; transient network blips shouldn't stop the wait.
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [loadDashboard, pollingPrId, refreshDetail]);
 
   const submitSearch = (event: FormEvent) => {
     event.preventDefault();
@@ -719,19 +1251,19 @@ export default function App() {
     <main className="min-h-screen">
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-6">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent text-sm font-bold text-white shadow-sm">
-            PR
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent text-sm font-bold text-white shadow-sm">
+              PR
+            </div>
+            <div>
+              <h1 className="text-base font-semibold tracking-tight text-slate-950">
+                PR Reviewer
+              </h1>
+              <p className="text-xs text-slate-500">Azure DevOps workspace</p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-base font-semibold tracking-tight text-slate-950">
-              PR Reviewer
-            </h1>
-            <p className="text-xs text-slate-500">Azure DevOps workspace</p>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <nav className="mr-1 flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+          <nav className="flex rounded-lg border border-slate-200 bg-slate-50 p-1">
             <button
               className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
                 view === "dashboard"
@@ -755,7 +1287,19 @@ export default function App() {
             >
               Models
             </button>
+            <button
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                view === "rules"
+                  ? "bg-white text-slate-900 shadow-sm"
+                  : "text-slate-500 hover:text-slate-800"
+              }`}
+              onClick={() => setView("rules")}
+            >
+              Rules
+            </button>
           </nav>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
           {view === "dashboard" && (
             <>
           <button
@@ -795,7 +1339,7 @@ export default function App() {
         </div>
       </header>
 
-      {error && view === "models" && (
+      {error && (view === "models" || view === "rules") && (
         <div className="mx-auto max-w-7xl px-4 pt-6 sm:px-6">
           <p className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
             {error}
@@ -808,33 +1352,32 @@ export default function App() {
           request={request}
           onError={(message) => setError(message)}
         />
+      ) : view === "rules" ? (
+        <RulesPage
+          request={request}
+          onError={(message) => setError(message)}
+        />
       ) : (
       <>
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
-        <div>
+      <div className="mb-6">
         <p className="text-sm font-medium text-accent">Overview</p>
         <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">
           Review activity
         </h2>
-        </div>
-        {metrics?.active_model_name && (
-          <p className="rounded-lg border border-teal-100 bg-teal-50 px-3 py-1.5 text-sm text-teal-800">
-            Active model:{" "}
-            <span className="font-semibold">{metrics.active_model_name}</span>
-            {metrics.active_model_id ? (
-              <span className="text-teal-700"> · {metrics.active_model_id}</span>
-            ) : null}
-          </p>
-        )}
       </div>
 
-      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {[
           ["PRs reviewed", metrics?.total_prs_reviewed.toLocaleString() ?? "—"],
-          ["Tokens used", metrics?.tokens_used.toLocaleString() ?? "—"],
-          ["Total cost", `$${metrics?.estimated_cost_usd.toFixed(4) ?? "—"}`],
-          ["Cost today", `$${metrics?.daily_cost_usd.toFixed(4) ?? "—"}`],
+          [
+            "Active model",
+            metrics?.active_model_name
+              ? metrics.active_model_id
+                ? `${metrics.active_model_name} · ${metrics.active_model_id}`
+                : metrics.active_model_name
+              : "None",
+          ],
         ].map(([label, value]) => (
           <div
             key={label}
@@ -843,7 +1386,7 @@ export default function App() {
             <p className="text-xs font-medium text-slate-500">
               {label}
             </p>
-            <p className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">
+            <p className="mt-2 break-words text-2xl font-semibold tracking-tight text-slate-950">
               {value}
             </p>
           </div>
@@ -853,7 +1396,15 @@ export default function App() {
       <section className="mt-8 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
         <div>
-          <h2 className="font-semibold text-slate-950">Pull requests</h2>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="font-semibold text-slate-950">Pull requests</h2>
+            {!loading && (
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-slate-200/80">
+                {total.toLocaleString()} record
+                {total === 1 ? "" : "s"}
+              </span>
+            )}
+          </div>
           <p className="mt-0.5 text-xs text-slate-500">
             Created by you or assigned for your review
           </p>
@@ -882,9 +1433,10 @@ export default function App() {
       )}
 
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[760px] border-separate border-spacing-0 text-left text-sm">
+        <table className="w-full min-w-[820px] border-separate border-spacing-0 text-left text-sm">
           <thead>
-            <tr className="bg-slate-900 text-left text-xs text-slate-300">
+            <tr className="bg-accent text-left text-xs text-teal-50">
+              <th className="w-14 px-4 py-3.5 font-medium">No.</th>
               <th className="px-5 py-3.5 font-medium">Pull request</th>
               <th className="px-4 py-3.5 font-medium">Repository</th>
               <th className="px-4 py-3.5 font-medium">Author</th>
@@ -897,7 +1449,7 @@ export default function App() {
               <Fragment key={group.label}>
                 <tr>
                   <td
-                    colSpan={5}
+                    colSpan={6}
                     className="border-y border-teal-100 bg-teal-50/80 px-5 py-2.5"
                   >
                     <div className="flex items-center gap-3">
@@ -914,6 +1466,7 @@ export default function App() {
                 </tr>
                 {group.items.map((pr, index) => {
                   const status = pr.latest_iteration?.status;
+                  const recordNo = prRecordNumbers.get(pr.pr_id) ?? index + 1;
                   return (
                     <tr
                       key={pr.pr_id}
@@ -922,6 +1475,9 @@ export default function App() {
                       } hover:bg-teal-50/60`}
                       onClick={() => void openDetail(pr.pr_id)}
                     >
+                      <td className="px-4 py-4 font-mono text-xs tabular-nums text-slate-500">
+                        {recordNo}
+                      </td>
                       <td className="px-5 py-4">
                         <div className="flex items-start gap-3">
                           <span className="mt-0.5 flex h-9 min-w-9 shrink-0 items-center justify-center rounded-xl bg-accent px-1.5 text-[11px] font-bold leading-none text-white shadow-sm">
@@ -1025,12 +1581,20 @@ export default function App() {
         <ReviewDetail
           detail={detail}
           queueing={queueing}
-          onClose={() => setDetail(null)}
+          reviewing={reviewingPrId === detail.pr_id}
+          error={error}
+          onClose={() => {
+            setDetail(null);
+            setReviewingPrId(null);
+          }}
           onRereview={async () => {
             setQueueing(true);
+            setError("");
             try {
               await request(`/prs/${detail.pr_id}/re-review`, { method: "POST" });
-              setError("");
+              setReviewingPrId(detail.pr_id);
+              await refreshDetail(detail.pr_id);
+              void loadDashboard();
             } catch (queueError) {
               setError(
                 queueError instanceof Error ? queueError.message : "Unable to queue",

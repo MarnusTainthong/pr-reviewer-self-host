@@ -13,6 +13,13 @@ import httpx
 from .config import Settings
 
 
+SEVERITY_EMOJI = {
+    "critical": "🔴",
+    "suggestion": "🟡",
+    "nit": "⚪",
+}
+
+
 class AzureDevOpsError(Exception):
     def __init__(self, message: str, transient: bool) -> None:
         super().__init__(message)
@@ -76,11 +83,19 @@ class AzureDevOpsClient:
 
             if response.status_code < 400:
                 return response
-            transient = response.status_code == 429 or response.status_code >= 500
+            body = response.text[:500]
+            # Folder/tree content requests never succeed on retry.
+            tree_as_blob = (
+                "expected a blob" in body.casefold()
+                or "gitunexpectedobjecttypeexception" in body.casefold()
+            )
+            transient = (
+                not tree_as_blob
+                and (response.status_code == 429 or response.status_code >= 500)
+            )
             if not transient or attempt == 3:
                 raise AzureDevOpsError(
-                    f"Azure DevOps returned {response.status_code}: "
-                    f"{response.text[:500]}",
+                    f"Azure DevOps returned {response.status_code}: {body}",
                     transient=transient,
                 )
             await asyncio.sleep(self._retry_delay(response, attempt))
@@ -117,6 +132,14 @@ class AzureDevOpsClient:
                 results.append(self._parse_pr(raw))
         return results
 
+    async def get_repository_id(self, repository_name: str) -> str:
+        response = await self._request(
+            "GET",
+            f"{self.base_url}/repositories/{repository_name}",
+            params={"api-version": "7.1"},
+        )
+        return response.json()["id"]
+
     async def get_pr(self, repository_id: str, pr_id: int) -> PullRequestData:
         response = await self._request(
             "GET",
@@ -124,6 +147,12 @@ class AzureDevOpsClient:
             params={"api-version": "7.1"},
         )
         return self._parse_pr(response.json())
+
+    async def get_pr_by_repository_name(
+        self, repository_name: str, pr_id: int
+    ) -> PullRequestData:
+        repository_id = await self.get_repository_id(repository_name)
+        return await self.get_pr(repository_id, pr_id)
 
     def _is_created_by_me(self, raw: dict[str, Any]) -> bool:
         return self._identity_matches(raw.get("createdBy", {}))
@@ -204,7 +233,10 @@ class AzureDevOpsClient:
         patches: list[str] = []
         changed_lines = 0
         for change in changes_data.get("changes", []):
-            path = change.get("item", {}).get("path", "").lstrip("/")
+            item = change.get("item", {})
+            if item.get("isFolder") or str(item.get("gitObjectType", "")).casefold() == "tree":
+                continue
+            path = item.get("path", "").lstrip("/")
             if not path or self._excluded(path):
                 continue
             change_type = str(change.get("changeType", "")).casefold()
@@ -242,20 +274,29 @@ class AzureDevOpsClient:
     async def _get_text(
         self, repository_id: str, path: str, commit_id: str
     ) -> str | None:
-        response = await self._request(
-            "GET",
-            f"{self.base_url}/repositories/{repository_id}/items",
-            params={
-                "path": f"/{path}",
-                "versionDescriptor.version": commit_id,
-                "versionDescriptor.versionType": "commit",
-                "includeContent": "true",
-                "api-version": "7.1",
-            },
-        )
+        try:
+            response = await self._request(
+                "GET",
+                f"{self.base_url}/repositories/{repository_id}/items",
+                params={
+                    "path": f"/{path}",
+                    "versionDescriptor.version": commit_id,
+                    "versionDescriptor.versionType": "commit",
+                    "includeContent": "true",
+                    "api-version": "7.1",
+                },
+            )
+        except AzureDevOpsError as exc:
+            # Folder/tree objects and missing blobs are not reviewable text.
+            message = str(exc).casefold()
+            if "resolved to a tree" in message or "expected a blob" in message:
+                return None
+            raise
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             data = response.json()
+            if data.get("isFolder") or str(data.get("gitObjectType", "")).casefold() == "tree":
+                return None
             content = data.get("content")
             return content if isinstance(content, str) else None
         try:
@@ -278,13 +319,16 @@ class AzureDevOpsClient:
         file_path: str,
         line: int,
         severity: str,
+        category: str,
         comment: str,
     ) -> None:
+        emoji = SEVERITY_EMOJI.get(severity, "⚪")
+        content = f"**AI review — {emoji} {severity} ({category})**\n\n{comment}"
         body = {
             "comments": [
                 {
                     "parentCommentId": 0,
-                    "content": f"**AI review — {severity}**\n\n{comment}",
+                    "content": content,
                     "commentType": 1,
                 }
             ],

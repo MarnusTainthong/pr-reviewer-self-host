@@ -4,7 +4,6 @@ import logging
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import func
 from sqlmodel import select
 
 from .azure_devops import AzureDevOpsClient, AzureDevOpsError, PullRequestData
@@ -93,22 +92,11 @@ class ReviewScheduler:
                 raise
 
     async def fetch_prs(self) -> int:
-        """Fetch assigned PRs into the DB, then review them in the background."""
+        """Fetch assigned PRs into the DB without reviewing."""
         prs = await self.azure.list_assigned_active_prs()
         for pr in prs:
             await self._upsert_pr(pr)
-        asyncio.create_task(self._review_fetched(prs))
         return len(prs)
-
-    async def _review_fetched(self, prs: list[PullRequestData]) -> None:
-        global last_successful_poll
-        async with review_lock:
-            for pr in prs:
-                try:
-                    await self._review_if_needed(pr)
-                except Exception:
-                    logger.exception("Review failed for PR %s", pr.pr_id)
-            last_successful_poll = datetime.now(timezone.utc)
 
     async def _upsert_pr(self, pr: PullRequestData) -> None:
         now = utc_now()
@@ -138,15 +126,48 @@ class ReviewScheduler:
                 stored_pr.updated_at = now
             await session.commit()
 
-    async def manual_review(self, pr_id: int) -> None:
-        async with review_lock:
-            prs = await self.azure.list_assigned_active_prs()
-            pr = next((item for item in prs if item.pr_id == pr_id), None)
-            if pr is None:
-                raise ValueError(
-                    "PR is not active, or was not created by / assigned to the configured identity"
-                )
-            await self._review_if_needed(pr, force=True)
+    async def manual_review(self, pr_id: int) -> str:
+        """Force-review the current source commit using the full target→source diff."""
+        async with session_factory() as session:
+            stored_pr = await session.get(PullRequest, pr_id)
+            if stored_pr is None:
+                raise ValueError(f"Pull request {pr_id} was not found")
+            repository_name = stored_pr.repository_name
+
+        try:
+            pr = await self.azure.get_pr_by_repository_name(repository_name, pr_id)
+        except AzureDevOpsError as exc:
+            await self._fail_latest_iteration(
+                pr_id,
+                f"Unable to load PR from Azure DevOps: {exc}",
+            )
+            raise
+
+        await self._prepare_iteration(pr, force=True)
+        asyncio.create_task(self._run_forced_review(pr))
+        return pr.source_commit
+
+    async def _run_forced_review(self, pr: PullRequestData) -> None:
+        try:
+            async with review_lock:
+                await self._review_if_needed(pr, force=True)
+        except Exception:
+            logger.exception("Forced review failed for PR %s", pr.pr_id)
+
+    async def _fail_latest_iteration(self, pr_id: int, message: str) -> None:
+        async with session_factory() as session:
+            statement = (
+                select(PrReviewIteration)
+                .where(PrReviewIteration.pr_id == pr_id)
+                .order_by(PrReviewIteration.created_at.desc())
+            )
+            iteration = (await session.exec(statement)).first()
+            if iteration is None:
+                return
+            iteration.status = "FAILED"
+            iteration.error_message = message[:2000]
+            iteration.error_type = "TRANSIENT"
+            await session.commit()
 
     async def _review_if_needed(
         self, pr: PullRequestData, force: bool = False
@@ -156,14 +177,6 @@ class ReviewScheduler:
             return
 
         try:
-            if await self._daily_cost() >= self.settings.daily_cost_cap_usd:
-                await self._set_skipped(
-                    iteration.id,
-                    "Daily LLM cost cap reached; this iteration will retry next day",
-                    transient=True,
-                )
-                return
-
             diff, changed_lines = await self.azure.build_diff(pr)
             if changed_lines > self.settings.max_changed_lines:
                 await self._set_skipped(
@@ -209,6 +222,7 @@ class ReviewScheduler:
                         finding.file,
                         finding.line,
                         finding.severity,
+                        finding.category,
                         finding.comment,
                     )
                     posted += 1
@@ -271,6 +285,10 @@ class ReviewScheduler:
                 iteration.error_message = None
                 iteration.error_type = None
                 iteration.reviewed_at = None
+                iteration.ai_summary = None
+                iteration.raw_ai_response = None
+                iteration.tokens_used = 0
+                iteration.estimated_cost_usd = 0.0
             elif not self._is_retryable(iteration):
                 await session.commit()
                 return None
@@ -287,14 +305,6 @@ class ReviewScheduler:
             iteration.status in {"FAILED", "SKIPPED"}
             and iteration.error_type == "TRANSIENT"
         )
-
-    async def _daily_cost(self) -> float:
-        today = datetime.now(timezone.utc).date().isoformat()
-        async with session_factory() as session:
-            statement = select(
-                func.coalesce(func.sum(PrReviewIteration.estimated_cost_usd), 0.0)
-            ).where(func.date(PrReviewIteration.created_at) == today)
-            return float((await session.exec(statement)).one())
 
     async def _set_skipped(
         self,
