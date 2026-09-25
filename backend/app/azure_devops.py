@@ -3,6 +3,7 @@ import base64
 import difflib
 import fnmatch
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -29,6 +30,7 @@ class PullRequestData:
     status: str
     source_commit: str
     target_commit: str
+    azure_created_at: datetime
 
 
 EXCLUDED_PATHS = (
@@ -46,11 +48,13 @@ EXCLUDED_PATHS = (
 class AzureDevOpsClient:
     def __init__(self, settings: Settings) -> None:
         token = base64.b64encode(f":{settings.azure_devops_pat}".encode()).decode()
+        self.organization = settings.azure_devops_organization
+        self.project = settings.azure_devops_project
         self.base_url = (
-            f"https://dev.azure.com/{settings.azure_devops_organization}/"
-            f"{settings.azure_devops_project}/_apis/git"
+            f"https://dev.azure.com/{self.organization}/"
+            f"{self.project}/_apis/git"
         )
-        self.reviewer = settings.azure_devops_reviewer.casefold()
+        self.identity = settings.azure_devops_reviewer.casefold()
         self.max_changed_lines = settings.max_changed_lines
         self.client = httpx.AsyncClient(
             headers={"Authorization": f"Basic {token}"},
@@ -101,6 +105,7 @@ class AzureDevOpsClient:
         return float(2**attempt)
 
     async def list_assigned_active_prs(self) -> list[PullRequestData]:
+        """Active PRs created by or assigned to the configured identity."""
         response = await self._request(
             "GET",
             f"{self.base_url}/pullrequests",
@@ -108,7 +113,7 @@ class AzureDevOpsClient:
         )
         results = []
         for raw in response.json().get("value", []):
-            if any(self._reviewer_matches(item) for item in raw.get("reviewers", [])):
+            if self._is_created_by_me(raw) or self._is_assigned_to_me(raw):
                 results.append(self._parse_pr(raw))
         return results
 
@@ -120,27 +125,62 @@ class AzureDevOpsClient:
         )
         return self._parse_pr(response.json())
 
-    def _reviewer_matches(self, reviewer: dict[str, Any]) -> bool:
-        candidates = (
-            reviewer.get("id", ""),
-            reviewer.get("displayName", ""),
-            reviewer.get("uniqueName", ""),
-        )
-        return self.reviewer in {str(candidate).casefold() for candidate in candidates}
+    def _is_created_by_me(self, raw: dict[str, Any]) -> bool:
+        return self._identity_matches(raw.get("createdBy", {}))
 
-    @staticmethod
-    def _parse_pr(raw: dict[str, Any]) -> PullRequestData:
+    def _is_assigned_to_me(self, raw: dict[str, Any]) -> bool:
+        return any(
+            self._identity_matches(item) for item in raw.get("reviewers", [])
+        )
+
+    def _identity_matches(self, identity: dict[str, Any]) -> bool:
+        candidates = (
+            identity.get("id", ""),
+            identity.get("displayName", ""),
+            identity.get("uniqueName", ""),
+        )
+        return self.identity in {str(candidate).casefold() for candidate in candidates}
+
+    def _web_url(self, repository_name: str, pr_id: int) -> str:
+        return (
+            f"https://dev.azure.com/{self.organization}/{self.project}/_git/"
+            f"{repository_name}/pullrequest/{pr_id}"
+        )
+
+    def _parse_pr(self, raw: dict[str, Any]) -> PullRequestData:
         repository = raw["repository"]
+        repository_name = repository["name"]
+        pr_id = raw["pullRequestId"]
+        creation_date = raw.get("creationDate")
+        if not creation_date:
+            raise AzureDevOpsError(
+                f"PR {pr_id} is missing creationDate from Azure DevOps",
+                transient=False,
+            )
         return PullRequestData(
-            pr_id=raw["pullRequestId"],
+            pr_id=pr_id,
             title=raw["title"],
             author_name=raw["createdBy"]["displayName"],
             repository_id=repository["id"],
-            repository_name=repository["name"],
-            url=raw.get("_links", {}).get("web", {}).get("href", raw["url"]),
+            repository_name=repository_name,
+            url=self._web_url(repository_name, pr_id),
             status=raw["status"].casefold(),
             source_commit=raw["lastMergeSourceCommit"]["commitId"],
             target_commit=raw["lastMergeTargetCommit"]["commitId"],
+            azure_created_at=self._parse_datetime(creation_date),
+        )
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value:
+            normalized = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        raise AzureDevOpsError(
+            f"Invalid Azure DevOps datetime value: {value!r}",
+            transient=False,
         )
 
     async def build_diff(self, pr: PullRequestData) -> tuple[str, int]:

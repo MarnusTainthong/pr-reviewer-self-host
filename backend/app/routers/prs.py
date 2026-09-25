@@ -17,7 +17,7 @@ router = APIRouter(prefix="/prs", tags=["pull requests"])
 @router.get("")
 async def list_pull_requests(
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    page_size: int = Query(default=40, ge=1, le=100),
     search: str | None = Query(default=None, max_length=200),
 ):
     filters = []
@@ -35,7 +35,7 @@ async def list_pull_requests(
         statement = (
             select(PullRequest)
             .options(selectinload(PullRequest.iterations))
-            .order_by(PullRequest.updated_at.desc())
+            .order_by(PullRequest.azure_created_at.desc(), PullRequest.pr_id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
@@ -48,6 +48,16 @@ async def list_pull_requests(
     items = []
     for pr in prs:
         latest = max(pr.iterations, key=lambda item: item.created_at, default=None)
+        reviewed_at = next(
+            (
+                item.reviewed_at
+                for item in sorted(
+                    pr.iterations, key=lambda item: item.created_at, reverse=True
+                )
+                if item.reviewed_at is not None
+            ),
+            None,
+        )
         items.append(
             {
                 "pr_id": pr.pr_id,
@@ -56,7 +66,9 @@ async def list_pull_requests(
                 "repository_name": pr.repository_name,
                 "pr_url": pr.pr_url,
                 "pr_status": pr.pr_status,
-                "updated_at": pr.updated_at,
+                "azure_created_at": pr.azure_created_at,
+                "fetched_at": pr.fetched_at,
+                "reviewed_at": reviewed_at,
                 "latest_iteration": latest,
             }
         )
@@ -81,8 +93,18 @@ async def get_pull_request(pr_id: int):
         "repository_name": pr.repository_name,
         "pr_url": pr.pr_url,
         "pr_status": pr.pr_status,
-        "created_at": pr.created_at,
-        "updated_at": pr.updated_at,
+        "azure_created_at": pr.azure_created_at,
+        "fetched_at": pr.fetched_at,
+        "reviewed_at": next(
+            (
+                item.reviewed_at
+                for item in sorted(
+                    pr.iterations, key=lambda item: item.created_at, reverse=True
+                )
+                if item.reviewed_at is not None
+            ),
+            None,
+        ),
         "iterations": sorted(
             pr.iterations, key=lambda item: item.created_at, reverse=True
         ),
@@ -94,6 +116,22 @@ async def _run_manual_review(review_scheduler, pr_id: int) -> None:
         await review_scheduler.manual_review(pr_id)
     except Exception:
         logger.exception("Manual review failed for PR %s", pr_id)
+
+
+@router.post("/fetch")
+async def fetch_pull_requests(request: Request):
+    try:
+        count = await request.app.state.review_scheduler.fetch_prs()
+    except Exception as exc:
+        logger.exception("Manual Azure DevOps fetch failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc) or "Azure DevOps fetch failed",
+        ) from exc
+    return {
+        "message": "Fetch from Azure DevOps completed; reviews queued",
+        "fetched": count,
+    }
 
 
 @router.post("/{pr_id}/re-review", status_code=status.HTTP_202_ACCEPTED)

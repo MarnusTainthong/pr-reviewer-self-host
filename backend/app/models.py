@@ -18,10 +18,29 @@ class PullRequest(SQLModel, table=True):
     repository_name: str
     pr_url: str
     pr_status: str
+    # When the PR was created in Azure DevOps.
+    azure_created_at: Optional[datetime] = Field(default=None)
+    # When this app last fetched the PR from Azure DevOps.
+    fetched_at: Optional[datetime] = Field(default=None)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
     iterations: list["PrReviewIteration"] = Relationship(back_populates="pull_request")
+
+
+class LlmModel(SQLModel, table=True):
+    __tablename__ = "llm_models"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(min_length=1, max_length=120)
+    base_url: str = Field(min_length=1, max_length=500)
+    api_key: str = Field(min_length=1)
+    model: str = Field(min_length=1, max_length=200)
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+    is_active: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class PrReviewIteration(SQLModel, table=True):

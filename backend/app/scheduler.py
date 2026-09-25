@@ -23,10 +23,39 @@ class ReviewScheduler:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.azure = AzureDevOpsClient(settings)
-        self.llm = LlmClient(settings)
+        self.llm = LlmClient()
         self.scheduler = AsyncIOScheduler(timezone="UTC")
 
     def start(self) -> None:
+        if not self.settings.auto_pr_review_enabled:
+            logger.info("Auto PR review is disabled; poller will not start")
+            return
+        self._ensure_poll_job(run_immediately=True)
+
+    async def stop(self) -> None:
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+        await self.azure.close()
+        await self.llm.close()
+
+    def set_auto_review_enabled(self, enabled: bool) -> bool:
+        self.settings.auto_pr_review_enabled = enabled
+        if enabled:
+            self._ensure_poll_job(run_immediately=True)
+            logger.info("Auto PR review enabled")
+        else:
+            self._remove_poll_job()
+            logger.info("Auto PR review disabled")
+        return enabled
+
+    def _ensure_poll_job(self, *, run_immediately: bool) -> None:
+        if not self.scheduler.running:
+            self.scheduler.start()
+        existing = self.scheduler.get_job("azure-devops-poll")
+        if existing is not None:
+            if run_immediately:
+                existing.modify(next_run_time=utc_now())
+            return
         self.scheduler.add_job(
             self.poll,
             "interval",
@@ -34,16 +63,20 @@ class ReviewScheduler:
             id="azure-devops-poll",
             max_instances=1,
             coalesce=True,
-            next_run_time=utc_now(),
+            next_run_time=utc_now() if run_immediately else None,
         )
-        self.scheduler.start()
 
-    async def stop(self) -> None:
-        self.scheduler.shutdown(wait=False)
-        await self.azure.close()
-        await self.llm.close()
+    def _remove_poll_job(self) -> None:
+        if self.scheduler.get_job("azure-devops-poll") is not None:
+            self.scheduler.remove_job("azure-devops-poll")
 
     async def poll(self) -> None:
+        if not self.settings.auto_pr_review_enabled:
+            logger.debug("Auto PR review is disabled; skipping poll")
+            return
+        await self._run_poll()
+
+    async def _run_poll(self) -> int:
         global last_successful_poll
         async with review_lock:
             try:
@@ -54,15 +87,65 @@ class ReviewScheduler:
                     except Exception:
                         logger.exception("Review failed for PR %s", pr.pr_id)
                 last_successful_poll = datetime.now(timezone.utc)
+                return len(prs)
             except Exception:
                 logger.exception("Azure DevOps poll failed")
+                raise
+
+    async def fetch_prs(self) -> int:
+        """Fetch assigned PRs into the DB, then review them in the background."""
+        prs = await self.azure.list_assigned_active_prs()
+        for pr in prs:
+            await self._upsert_pr(pr)
+        asyncio.create_task(self._review_fetched(prs))
+        return len(prs)
+
+    async def _review_fetched(self, prs: list[PullRequestData]) -> None:
+        global last_successful_poll
+        async with review_lock:
+            for pr in prs:
+                try:
+                    await self._review_if_needed(pr)
+                except Exception:
+                    logger.exception("Review failed for PR %s", pr.pr_id)
+            last_successful_poll = datetime.now(timezone.utc)
+
+    async def _upsert_pr(self, pr: PullRequestData) -> None:
+        now = utc_now()
+        async with session_factory() as session:
+            stored_pr = await session.get(PullRequest, pr.pr_id)
+            if stored_pr is None:
+                session.add(
+                    PullRequest(
+                        pr_id=pr.pr_id,
+                        title=pr.title,
+                        author_name=pr.author_name,
+                        repository_name=pr.repository_name,
+                        pr_url=pr.url,
+                        pr_status=pr.status,
+                        azure_created_at=pr.azure_created_at,
+                        fetched_at=now,
+                    )
+                )
+            else:
+                stored_pr.title = pr.title
+                stored_pr.author_name = pr.author_name
+                stored_pr.repository_name = pr.repository_name
+                stored_pr.pr_url = pr.url
+                stored_pr.pr_status = pr.status
+                stored_pr.azure_created_at = pr.azure_created_at
+                stored_pr.fetched_at = now
+                stored_pr.updated_at = now
+            await session.commit()
 
     async def manual_review(self, pr_id: int) -> None:
         async with review_lock:
             prs = await self.azure.list_assigned_active_prs()
             pr = next((item for item in prs if item.pr_id == pr_id), None)
             if pr is None:
-                raise ValueError("PR is not active or is not assigned to the target reviewer")
+                raise ValueError(
+                    "PR is not active, or was not created by / assigned to the configured identity"
+                )
             await self._review_if_needed(pr, force=True)
 
     async def _review_if_needed(
@@ -147,6 +230,7 @@ class ReviewScheduler:
         self, pr: PullRequestData, force: bool
     ) -> PrReviewIteration | None:
         async with session_factory() as session:
+            now = utc_now()
             stored_pr = await session.get(PullRequest, pr.pr_id)
             if stored_pr is None:
                 stored_pr = PullRequest(
@@ -156,6 +240,8 @@ class ReviewScheduler:
                     repository_name=pr.repository_name,
                     pr_url=pr.url,
                     pr_status=pr.status,
+                    azure_created_at=pr.azure_created_at,
+                    fetched_at=now,
                 )
                 session.add(stored_pr)
             else:
@@ -164,7 +250,9 @@ class ReviewScheduler:
                 stored_pr.repository_name = pr.repository_name
                 stored_pr.pr_url = pr.url
                 stored_pr.pr_status = pr.status
-                stored_pr.updated_at = utc_now()
+                stored_pr.azure_created_at = pr.azure_created_at
+                stored_pr.fetched_at = now
+                stored_pr.updated_at = now
 
             statement = select(PrReviewIteration).where(
                 PrReviewIteration.pr_id == pr.pr_id,

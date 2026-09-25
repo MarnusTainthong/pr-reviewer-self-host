@@ -5,8 +5,10 @@ from typing import Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
+from sqlmodel import select
 
-from .config import Settings
+from .database import session_factory
+from .models import LlmModel
 
 
 SYSTEM_PROMPT = """You are a precise pull-request reviewer.
@@ -46,6 +48,16 @@ class ReviewResult(BaseModel):
 
 
 @dataclass
+class LlmConfig:
+    name: str
+    base_url: str
+    api_key: str
+    model: str
+    input_cost_per_million: float
+    output_cost_per_million: float
+
+
+@dataclass
 class LlmResponse:
     review: ReviewResult
     raw_response: str
@@ -59,21 +71,37 @@ class LlmError(Exception):
         self.transient = transient
 
 
-class LlmClient:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.client = httpx.AsyncClient(
-            base_url=settings.llm_base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            timeout=httpx.Timeout(90),
+async def get_active_llm_config() -> LlmConfig:
+    async with session_factory() as session:
+        model = (
+            await session.exec(select(LlmModel).where(LlmModel.is_active == True))  # noqa: E712
+        ).one_or_none()
+    if model is None:
+        raise LlmError(
+            "No active AI model configured. Add one on the Models page.",
+            transient=False,
         )
+    return LlmConfig(
+        name=model.name,
+        base_url=model.base_url.rstrip("/"),
+        api_key=model.api_key,
+        model=model.model,
+        input_cost_per_million=model.input_cost_per_million,
+        output_cost_per_million=model.output_cost_per_million,
+    )
+
+
+class LlmClient:
+    def __init__(self) -> None:
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(90))
 
     async def close(self) -> None:
         await self.client.aclose()
 
-    async def review(self, diff: str) -> LlmResponse:
+    async def review(self, diff: str, config: LlmConfig | None = None) -> LlmResponse:
+        active = config or await get_active_llm_config()
         payload = {
-            "model": self.settings.llm_model,
+            "model": active.model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -85,7 +113,7 @@ class LlmClient:
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
-        response = await self._post_with_backoff(payload)
+        response = await self._post_with_backoff(active, payload)
         data = response.json()
         try:
             raw = data["choices"][0]["message"]["content"]
@@ -97,8 +125,8 @@ class LlmClient:
         input_tokens = int(usage.get("prompt_tokens", 0))
         output_tokens = int(usage.get("completion_tokens", 0))
         cost = (
-            input_tokens * self.settings.llm_input_cost_per_million
-            + output_tokens * self.settings.llm_output_cost_per_million
+            input_tokens * active.input_cost_per_million
+            + output_tokens * active.output_cost_per_million
         ) / 1_000_000
         return LlmResponse(
             review=review,
@@ -107,10 +135,18 @@ class LlmClient:
             estimated_cost_usd=cost,
         )
 
-    async def _post_with_backoff(self, payload: dict) -> httpx.Response:
+    async def _post_with_backoff(
+        self, config: LlmConfig, payload: dict
+    ) -> httpx.Response:
+        url = f"{config.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {config.api_key}",
+            "api-key": config.api_key,
+            "Content-Type": "application/json",
+        }
         for attempt in range(4):
             try:
-                response = await self.client.post("/chat/completions", json=payload)
+                response = await self.client.post(url, json=payload, headers=headers)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt == 3:
                     raise LlmError(str(exc), transient=True) from exc

@@ -25,15 +25,15 @@ The API health endpoint is available at <http://localhost:8000/health>. All
 
 ## LLM provider and code handling
 
-The service sends filtered source diffs to the provider configured by
-`LLM_BASE_URL` and `LLM_MODEL`. Confirm that your organization approves that
-provider before use. Provider retention and training terms vary, and providers
-in other jurisdictions can create data-sovereignty concerns. DeepSeek-hosted
-models, for example, may process data in China.
+AI models are managed in the dashboard **Models** page (OpenAI-compatible
+base URL, API key, model id, and cost rates). Confirm that your organization
+approves the chosen provider before use. Provider retention and training
+terms vary, and providers in other jurisdictions can create data-sovereignty
+concerns. DeepSeek-hosted models, for example, may process data in China.
 
 Generated files, dependency locks, `dist/`, `vendor/`, and `node_modules/` are
 excluded. Diffs over `MAX_CHANGED_LINES` are skipped. The daily spend guard uses
-the configured per-million-token rates, so keep those rates current.
+each model's configured per-million-token rates, so keep those rates current.
 
 ## Local deployment
 

@@ -1,4 +1,4 @@
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -23,9 +23,31 @@ def configure_sqlite(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
+def _ensure_sqlite_columns(connection) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+    existing = {
+        row[1]
+        for row in connection.execute(
+            text("PRAGMA table_info(pull_requests)")
+        ).fetchall()
+    }
+    if not existing:
+        return
+    if "azure_created_at" not in existing:
+        connection.execute(
+            text("ALTER TABLE pull_requests ADD COLUMN azure_created_at DATETIME")
+        )
+    if "fetched_at" not in existing:
+        connection.execute(
+            text("ALTER TABLE pull_requests ADD COLUMN fetched_at DATETIME")
+        )
+
+
 async def init_database() -> None:
     async with engine.begin() as connection:
         await connection.run_sync(SQLModel.metadata.create_all)
+        await connection.run_sync(_ensure_sqlite_columns)
 
 
 async def get_session():

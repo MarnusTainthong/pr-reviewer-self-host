@@ -9,6 +9,7 @@ from .auth import require_auth
 from .config import get_settings
 from .database import engine, init_database
 from .routers.metrics import router as metrics_router
+from .routers.models import router as models_router
 from .routers.prs import router as prs_router
 from .scheduler import ReviewScheduler
 
@@ -32,7 +33,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -41,6 +42,9 @@ app.include_router(
 )
 app.include_router(
     metrics_router, prefix="/api", dependencies=[Depends(require_auth)]
+)
+app.include_router(
+    models_router, prefix="/api", dependencies=[Depends(require_auth)]
 )
 
 
@@ -56,5 +60,6 @@ async def health(response: Response):
     return {
         "status": "ok" if database == "connected" else "degraded",
         "database": database,
+        "auto_pr_review_enabled": settings.auto_pr_review_enabled,
         "last_successful_poll": scheduler_state.last_successful_poll,
     }
