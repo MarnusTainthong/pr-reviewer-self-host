@@ -59,6 +59,31 @@ async def create_rule(body: ReviewRuleBody):
     return _serialize(rule)
 
 
+class ReviewRuleImportBody(BaseModel):
+    rules: list[ReviewRuleBody] = Field(min_length=1, max_length=200)
+
+
+@router.post("/import")
+async def import_rules(body: ReviewRuleImportBody):
+    created: list[ReviewRule] = []
+    async with session_factory() as session:
+        for item in body.rules:
+            rule = ReviewRule(
+                title=item.title.strip(),
+                body=item.body.strip(),
+                is_enabled=item.is_enabled,
+            )
+            session.add(rule)
+            created.append(rule)
+        await session.commit()
+        for rule in created:
+            await session.refresh(rule)
+    return {
+        "imported": len(created),
+        "items": [_serialize(rule) for rule in created],
+    }
+
+
 @router.put("/{rule_id}")
 async def update_rule(rule_id: int, body: ReviewRuleUpdateBody):
     async with session_factory() as session:

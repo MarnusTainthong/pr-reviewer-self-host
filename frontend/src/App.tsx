@@ -709,8 +709,10 @@ function RulesPage({
 }) {
   const [rules, setRules] = useState<ReviewRuleItem[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [selectingRules, setSelectingRules] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState(emptyRuleForm);
 
@@ -770,6 +772,11 @@ function RulesPage({
     setSelectedIds(new Set(rules.map((rule) => rule.id)));
   };
 
+  const finishSelectingRules = () => {
+    setSelectingRules(false);
+    setSelectedIds(new Set());
+  };
+
   const exportRules = (items: ReviewRuleItem[]) => {
     if (items.length === 0) {
       onError("Select at least one rule to export");
@@ -794,6 +801,61 @@ function RulesPage({
     link.download = `review-rules-${stamp}.json`;
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const importRulesFromFile = async (file: File) => {
+    setImporting(true);
+    onError("");
+    try {
+      const text = await file.text();
+      const parsed: unknown = JSON.parse(text);
+      const rawRules = Array.isArray(parsed)
+        ? parsed
+        : parsed &&
+            typeof parsed === "object" &&
+            Array.isArray((parsed as { rules?: unknown }).rules)
+          ? (parsed as { rules: unknown[] }).rules
+          : null;
+      if (!rawRules || rawRules.length === 0) {
+        throw new Error("Import file must contain a non-empty rules array");
+      }
+      const rulesToImport = rawRules.map((item, index) => {
+        if (!item || typeof item !== "object") {
+          throw new Error(`Rule ${index + 1} is invalid`);
+        }
+        const row = item as {
+          title?: unknown;
+          body?: unknown;
+          is_enabled?: unknown;
+        };
+        const title = typeof row.title === "string" ? row.title.trim() : "";
+        const body = typeof row.body === "string" ? row.body.trim() : "";
+        if (!title || !body) {
+          throw new Error(`Rule ${index + 1} needs a title and body`);
+        }
+        return {
+          title,
+          body,
+          is_enabled: typeof row.is_enabled === "boolean" ? row.is_enabled : true,
+        };
+      });
+      const result = await request<{ imported: number }>("/rules/import", {
+        method: "POST",
+        body: JSON.stringify({ rules: rulesToImport }),
+      });
+      await loadRules();
+      if (!result.imported) {
+        onError("No rules were imported");
+      }
+    } catch (importError) {
+      onError(
+        importError instanceof Error
+          ? importError.message
+          : "Unable to import rules",
+      );
+    } finally {
+      setImporting(false);
+    }
   };
 
   const saveRule = async (event: FormEvent) => {
@@ -828,7 +890,7 @@ function RulesPage({
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+      <div className="mb-6">
         <div>
           <p className="text-sm font-medium text-accent">Settings</p>
           <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">
@@ -838,52 +900,84 @@ function RulesPage({
             Enabled rules are added to the reviewer prompt for every PR review.
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
-            disabled={rules.length === 0}
-            onClick={() => exportRules(rules)}
-          >
-            Export all
-          </button>
-          <button
-            type="button"
-            className="rounded-lg bg-accent px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
-            disabled={selectedIds.size === 0}
-            onClick={() =>
-              exportRules(rules.filter((rule) => selectedIds.has(rule.id)))
-            }
-          >
-            Export selected ({selectedIds.size})
-          </button>
-        </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
         <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3">
               <h3 className="font-semibold text-slate-950">Configured rules</h3>
-              {!loading && rules.length > 0 && (
-                <label className="flex items-center gap-2 text-sm text-slate-600">
-                  <input
-                    type="checkbox"
-                    className="rounded border-slate-300 text-accent focus:ring-accent"
-                    checked={allSelected}
-                    onChange={toggleSelectAll}
-                  />
-                  Select all
-                </label>
+              {!loading && (
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-slate-200/80">
+                  {rules.length.toLocaleString()} rule
+                  {rules.length === 1 ? "" : "s"}
+                </span>
               )}
             </div>
-            {!loading && (
-              <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-slate-200/80">
-                {rules.length.toLocaleString()} rule
-                {rules.length === 1 ? "" : "s"}
-              </span>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <label
+                className={`rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 ${
+                  importing
+                    ? "cursor-not-allowed opacity-50"
+                    : "cursor-pointer hover:bg-slate-50"
+                }`}
+              >
+                <input
+                  type="file"
+                  accept="application/json,.json"
+                  className="sr-only"
+                  disabled={importing}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void importRulesFromFile(file);
+                  }}
+                />
+                {importing ? "Importing…" : "Import"}
+              </label>
+              <button
+                type="button"
+                className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                disabled={rules.length === 0}
+                onClick={() => exportRules(rules)}
+              >
+                Export all
+              </button>
+              <button
+                type="button"
+                className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                disabled={rules.length === 0}
+                onClick={() =>
+                  selectingRules ? finishSelectingRules() : setSelectingRules(true)
+                }
+              >
+                {selectingRules ? "Cancel" : "Select"}
+              </button>
+            </div>
           </div>
+          {selectingRules && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-teal-100 bg-teal-50 px-5 py-3">
+              <label className="flex items-center gap-2 text-sm font-medium text-teal-900">
+                <input
+                  type="checkbox"
+                  className="rounded border-teal-300 text-accent focus:ring-accent"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                />
+                Select all
+              </label>
+              <button
+                type="button"
+                className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                disabled={selectedIds.size === 0}
+                onClick={() =>
+                  exportRules(rules.filter((rule) => selectedIds.has(rule.id)))
+                }
+              >
+                Export selected ({selectedIds.size})
+              </button>
+            </div>
+          )}
           <div className="divide-y divide-slate-100">
             {rules.map((rule, index) => (
               <div
@@ -891,13 +985,15 @@ function RulesPage({
                 className="flex flex-wrap items-start justify-between gap-4 px-5 py-4"
               >
                 <div className="flex min-w-0 flex-1 gap-3">
-                  <input
-                    type="checkbox"
-                    className="mt-1.5 rounded border-slate-300 text-accent focus:ring-accent"
-                    checked={selectedIds.has(rule.id)}
-                    onChange={() => toggleSelected(rule.id)}
-                    aria-label={`Select ${rule.title}`}
-                  />
+                  {selectingRules && (
+                    <input
+                      type="checkbox"
+                      className="mt-1.5 rounded border-slate-300 text-accent focus:ring-accent"
+                      checked={selectedIds.has(rule.id)}
+                      onChange={() => toggleSelected(rule.id)}
+                      aria-label={`Select ${rule.title}`}
+                    />
+                  )}
                   <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-slate-100 font-mono text-xs font-semibold tabular-nums text-slate-600">
                     {index + 1}
                   </span>
@@ -1130,6 +1226,12 @@ export default function App() {
     void loadDashboard();
   }, [loadDashboard]);
 
+  useEffect(() => {
+    if (!token || view !== "dashboard") return;
+    const timer = window.setInterval(() => void loadDashboard(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [loadDashboard, token, view]);
+
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const rangeStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const rangeEnd = Math.min(page * pageSize, total);
@@ -1275,7 +1377,7 @@ export default function App() {
                 void loadDashboard();
               }}
             >
-              Dashboard
+              Pull requests
             </button>
             <button
               className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
@@ -1361,9 +1463,9 @@ export default function App() {
       <>
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
       <div className="mb-6">
-        <p className="text-sm font-medium text-accent">Overview</p>
+        <p className="text-sm font-medium text-accent">Azure DevOps</p>
         <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">
-          Review activity
+          Pull requests
         </h2>
       </div>
 
@@ -1397,7 +1499,7 @@ export default function App() {
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-semibold text-slate-950">Pull requests</h2>
+            <h2 className="font-semibold text-slate-950">All pull requests</h2>
             {!loading && (
               <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-slate-200/80">
                 {total.toLocaleString()} record
