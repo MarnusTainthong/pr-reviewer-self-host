@@ -15,13 +15,12 @@ PR ทุก 5 นาที วิเคราะห์ commit ใหม่ด�
    docker compose up --build
    ```
 
-4. เปิด <http://localhost:5173> แล้วกรอก `DASHBOARD_AUTH_TOKEN`
+4. เปิด `http://<server-ip>:5173` แล้วกรอก `DASHBOARD_AUTH_TOKEN`
 
-Health endpoint ของ API อยู่ที่ <http://localhost:8000/health> ส่วน endpoint ใต้
-`/api/*` ต้องส่ง bearer token ทุกครั้ง
-
-ค่า `VITE_API_BASE_URL` จะถูกฝังอยู่ใน frontend bundle หากเปลี่ยนค่าที่
-`docker-compose.yml` ต้อง build frontend image ใหม่
+Frontend จะ proxy `/api` และ `/health` ไปยัง backend ให้เอง จึงไม่ต้องฝัง IP
+ไว้ตอน build สามารถเข้าจากเครื่องใดก็ได้ใน private network Health endpoint
+ตรงของ API อยู่ที่ <http://localhost:8000/health> ส่วน endpoint ใต้ `/api/*`
+ต้องส่ง bearer token ทุกครั้ง
 
 ## LLM และการจัดการโค้ด
 

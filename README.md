@@ -17,11 +17,10 @@ comments, and records review history in SQLite.
 
 4. Open <http://localhost:5173> and enter `DASHBOARD_AUTH_TOKEN`.
 
-The API health endpoint is available at <http://localhost:8000/health>. All
-`/api/*` endpoints require the bearer token.
-
-`VITE_API_BASE_URL` is baked into the frontend bundle. If its value in
-`docker-compose.yml` changes, rebuild the frontend image.
+Open the dashboard at `http://<server-ip>:5173` from any machine on your private
+network. The frontend proxies `/api` and `/health` to the backend, so no API
+host needs to be baked in at build time. Direct API health is also available at
+<http://localhost:8000/health>. All `/api/*` endpoints require the bearer token.
 
 ## LLM provider and code handling
 
