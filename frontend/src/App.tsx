@@ -1,4 +1,12 @@
-import { FormEvent, Fragment, useCallback, useEffect, useState } from "react";
+import {
+  FormEvent,
+  Fragment,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api";
 
@@ -145,6 +153,19 @@ function groupPrsByMonth(prs: PullRequest[]) {
     .map(([, group]) => group);
 }
 
+function Spinner({ className = "" }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={`inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent ${className}`}
+    />
+  );
+}
+
+function Skeleton({ className = "" }: { className?: string }) {
+  return <span className={`block animate-pulse rounded bg-slate-200 ${className}`} />;
+}
+
 function Status({ value }: { value: string }) {
   const colors: Record<string, string> = {
     REVIEWED: "bg-emerald-100 text-emerald-800 ring-emerald-700/15",
@@ -267,6 +288,61 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
   );
 }
 
+function Drawer({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  return (
+    <div className="fixed inset-0 z-10 flex justify-end bg-slate-950/50 backdrop-blur-[2px]">
+      <button
+        className="flex-1 cursor-default"
+        aria-label="Close details"
+        onClick={onClose}
+      />
+      <aside className="flex h-full w-full max-w-2xl min-w-0 flex-col overflow-hidden bg-slate-50 shadow-2xl">
+        {children}
+      </aside>
+    </div>
+  );
+}
+
+function DetailSkeleton({ onClose }: { onClose: () => void }) {
+  return (
+    <Drawer onClose={onClose}>
+      <div className="shrink-0 border-b border-slate-200 bg-white px-6 py-6 sm:px-8">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1 space-y-3">
+            <Skeleton className="h-3 w-40" />
+            <Skeleton className="h-6 w-3/4" />
+            <Skeleton className="h-4 w-52" />
+          </div>
+          <button
+            className="shrink-0 rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+        <div className="mt-5 flex gap-3">
+          <Skeleton className="h-9 w-44 rounded-lg" />
+          <Skeleton className="h-9 w-24 rounded-lg" />
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-7 sm:px-8">
+        <Skeleton className="h-3 w-28" />
+        {[0, 1].map((index) => (
+          <div
+            key={index}
+            className="space-y-3 rounded-xl border border-slate-200 bg-white p-5 shadow-sm"
+          >
+            <Skeleton className="h-5 w-20" />
+            <Skeleton className="h-3 w-36" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-2/3" />
+          </div>
+        ))}
+      </div>
+    </Drawer>
+  );
+}
+
 function ReviewDetail({
   detail,
   onClose,
@@ -289,13 +365,7 @@ function ReviewDetail({
     latest?.status === "ATTEMPTING";
   const busy = queueing || inProgress;
   return (
-    <div className="fixed inset-0 z-10 flex justify-end bg-slate-950/50 backdrop-blur-[2px]">
-      <button
-        className="flex-1 cursor-default"
-        aria-label="Close details"
-        onClick={onClose}
-      />
-      <aside className="flex h-full w-full max-w-2xl min-w-0 flex-col overflow-hidden bg-slate-50 shadow-2xl">
+    <Drawer onClose={onClose}>
         <div className="shrink-0 border-b border-slate-200 bg-white px-6 py-6 sm:px-8">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
@@ -326,10 +396,11 @@ function ReviewDetail({
             Open in Azure DevOps
           </a>
           <button
-            className="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-teal-800 disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-teal-800 disabled:opacity-50"
             disabled={busy}
             onClick={onRereview}
           >
+            {busy && <Spinner />}
             {queueing
               ? "Queueing…"
               : inProgress
@@ -454,8 +525,7 @@ function ReviewDetail({
           })}
         </div>
         </div>
-      </aside>
-    </div>
+    </Drawer>
   );
 }
 
@@ -477,6 +547,10 @@ function ModelsPage({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testingId, setTestingId] = useState<number | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    id: number;
+    kind: "activate" | "delete";
+  } | null>(null);
   const [testResults, setTestResults] = useState<
     Record<number, { success: boolean; message: string }>
   >({});
@@ -546,6 +620,32 @@ function ModelsPage({
       onError(saveError instanceof Error ? saveError.message : "Unable to save model");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const runModelAction = async (
+    model: LlmModelItem,
+    kind: "activate" | "delete",
+  ) => {
+    setPendingAction({ id: model.id, kind });
+    try {
+      if (kind === "activate") {
+        await request(`/models/${model.id}/activate`, { method: "POST" });
+      } else {
+        await request(`/models/${model.id}`, { method: "DELETE" });
+        if (editingId === model.id) resetForm();
+      }
+      await loadModels();
+    } catch (actionError) {
+      onError(
+        actionError instanceof Error
+          ? actionError.message
+          : kind === "activate"
+            ? "Unable to activate"
+            : "Unable to delete",
+      );
+    } finally {
+      setPendingAction(null);
     }
   };
 
@@ -638,30 +738,25 @@ function ModelsPage({
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <button
-                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                     disabled={testingId !== null}
                     onClick={() => void testModel(model)}
                   >
+                    {testingId === model.id && <Spinner />}
                     {testingId === model.id ? "Testing…" : "Test connection"}
                   </button>
                   {!model.is_active && (
                     <button
-                      className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-800"
-                      onClick={() =>
-                        void request(`/models/${model.id}/activate`, {
-                          method: "POST",
-                        })
-                          .then(loadModels)
-                          .catch((activateError) =>
-                            onError(
-                              activateError instanceof Error
-                                ? activateError.message
-                                : "Unable to activate",
-                            ),
-                          )
-                      }
+                      className="inline-flex items-center gap-2 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                      disabled={pendingAction !== null}
+                      onClick={() => void runModelAction(model, "activate")}
                     >
-                      Set active
+                      {pendingAction?.id === model.id &&
+                        pendingAction.kind === "activate" && <Spinner />}
+                      {pendingAction?.id === model.id &&
+                      pendingAction.kind === "activate"
+                        ? "Activating…"
+                        : "Set active"}
                     </button>
                   )}
                   <button
@@ -671,23 +766,16 @@ function ModelsPage({
                     Edit
                   </button>
                   <button
-                    className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50"
-                    onClick={() =>
-                      void request(`/models/${model.id}`, { method: "DELETE" })
-                        .then(() => {
-                          if (editingId === model.id) resetForm();
-                          return loadModels();
-                        })
-                        .catch((deleteError) =>
-                          onError(
-                            deleteError instanceof Error
-                              ? deleteError.message
-                              : "Unable to delete",
-                          ),
-                        )
-                    }
+                    className="inline-flex items-center gap-2 rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                    disabled={pendingAction !== null}
+                    onClick={() => void runModelAction(model, "delete")}
                   >
-                    Delete
+                    {pendingAction?.id === model.id &&
+                      pendingAction.kind === "delete" && <Spinner />}
+                    {pendingAction?.id === model.id &&
+                    pendingAction.kind === "delete"
+                      ? "Deleting…"
+                      : "Delete"}
                   </button>
                 </div>
               </div>
@@ -697,9 +785,15 @@ function ModelsPage({
                 No models yet. Add one to start reviewing.
               </p>
             )}
-            {loading && (
-              <p className="p-8 text-center text-sm text-slate-500">Loading…</p>
-            )}
+            {loading &&
+              models.length === 0 &&
+              [0, 1, 2].map((index) => (
+                <div key={index} className="space-y-2 px-5 py-4">
+                  <Skeleton className="h-4 w-40" />
+                  <Skeleton className="h-3 w-28" />
+                  <Skeleton className="h-3 w-56" />
+                </div>
+              ))}
           </div>
         </section>
 
@@ -733,9 +827,10 @@ function ModelsPage({
             ))}
             <div className="flex gap-2 pt-2">
               <button
-                className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
                 disabled={saving}
               >
+                {saving && <Spinner />}
                 {saving ? "Saving…" : editingId == null ? "Add model" : "Save changes"}
               </button>
               {editingId != null && (
@@ -774,6 +869,10 @@ function RulesPage({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{
+    id: number;
+    kind: "toggle" | "delete";
+  } | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState(emptyRuleForm);
 
@@ -919,6 +1018,29 @@ function RulesPage({
     }
   };
 
+  const runRuleAction = async (rule: ReviewRuleItem, kind: "toggle" | "delete") => {
+    setPendingAction({ id: rule.id, kind });
+    try {
+      if (kind === "toggle") {
+        await request(`/rules/${rule.id}/toggle`, { method: "POST" });
+      } else {
+        await request(`/rules/${rule.id}`, { method: "DELETE" });
+        if (editingId === rule.id) resetForm();
+      }
+      await loadRules();
+    } catch (actionError) {
+      onError(
+        actionError instanceof Error
+          ? actionError.message
+          : kind === "toggle"
+            ? "Unable to toggle"
+            : "Unable to delete",
+      );
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
   const saveRule = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
@@ -977,7 +1099,7 @@ function RulesPage({
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <label
-                className={`rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 ${
+                className={`inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 ${
                   importing
                     ? "cursor-not-allowed opacity-50"
                     : "cursor-pointer hover:bg-slate-50"
@@ -994,6 +1116,7 @@ function RulesPage({
                     if (file) void importRulesFromFile(file);
                   }}
                 />
+                {importing && <Spinner />}
                 {importing ? "Importing…" : "Import"}
               </label>
               <button
@@ -1078,22 +1201,17 @@ function RulesPage({
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <button
-                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                    onClick={() =>
-                      void request(`/rules/${rule.id}/toggle`, {
-                        method: "POST",
-                      })
-                        .then(loadRules)
-                        .catch((toggleError) =>
-                          onError(
-                            toggleError instanceof Error
-                              ? toggleError.message
-                              : "Unable to toggle",
-                          ),
-                        )
-                    }
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    disabled={pendingAction !== null}
+                    onClick={() => void runRuleAction(rule, "toggle")}
                   >
-                    {rule.is_enabled ? "Disable" : "Enable"}
+                    {pendingAction?.id === rule.id &&
+                      pendingAction.kind === "toggle" && <Spinner />}
+                    {pendingAction?.id === rule.id && pendingAction.kind === "toggle"
+                      ? "Updating…"
+                      : rule.is_enabled
+                        ? "Disable"
+                        : "Enable"}
                   </button>
                   <button
                     className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
@@ -1102,23 +1220,15 @@ function RulesPage({
                     Edit
                   </button>
                   <button
-                    className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50"
-                    onClick={() =>
-                      void request(`/rules/${rule.id}`, { method: "DELETE" })
-                        .then(() => {
-                          if (editingId === rule.id) resetForm();
-                          return loadRules();
-                        })
-                        .catch((deleteError) =>
-                          onError(
-                            deleteError instanceof Error
-                              ? deleteError.message
-                              : "Unable to delete",
-                          ),
-                        )
-                    }
+                    className="inline-flex items-center gap-2 rounded-lg border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                    disabled={pendingAction !== null}
+                    onClick={() => void runRuleAction(rule, "delete")}
                   >
-                    Delete
+                    {pendingAction?.id === rule.id &&
+                      pendingAction.kind === "delete" && <Spinner />}
+                    {pendingAction?.id === rule.id && pendingAction.kind === "delete"
+                      ? "Deleting…"
+                      : "Delete"}
                   </button>
                 </div>
               </div>
@@ -1128,9 +1238,18 @@ function RulesPage({
                 No rules yet. Add project-specific guidance for reviews.
               </p>
             )}
-            {loading && (
-              <p className="p-8 text-center text-sm text-slate-500">Loading…</p>
-            )}
+            {loading &&
+              rules.length === 0 &&
+              [0, 1, 2].map((index) => (
+                <div key={index} className="flex gap-3 px-5 py-4">
+                  <Skeleton className="h-7 w-7 shrink-0 rounded-lg" />
+                  <div className="flex-1 space-y-2">
+                    <Skeleton className="h-4 w-48" />
+                    <Skeleton className="h-3 w-full" />
+                    <Skeleton className="h-3 w-2/3" />
+                  </div>
+                </div>
+              ))}
           </div>
         </section>
 
@@ -1185,9 +1304,10 @@ function RulesPage({
             </label>
             <div className="flex gap-2 pt-2">
               <button
-                className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
                 disabled={saving}
               >
+                {saving && <Spinner />}
                 {saving ? "Saving…" : editingId == null ? "Add rule" : "Save changes"}
               </button>
               {editingId != null && (
@@ -1219,7 +1339,12 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [activeSearch, setActiveSearch] = useState("");
   const [detail, setDetail] = useState<PullRequestDetail | null>(null);
+  const [openingPrId, setOpeningPrId] = useState<number | null>(null);
+  const openingPrIdRef = useRef<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const dashboardRequestId = useRef(0);
   const [queueing, setQueueing] = useState(false);
   const [reviewingPrId, setReviewingPrId] = useState<number | null>(null);
   const [togglingAuto, setTogglingAuto] = useState(false);
@@ -1254,9 +1379,11 @@ export default function App() {
     [token],
   );
 
-  const loadDashboard = useCallback(async () => {
+  const loadDashboard = useCallback(async ({ background = false } = {}) => {
     if (!token) return;
-    setLoading(true);
+    const requestId = ++dashboardRequestId.current;
+    if (background) setRefreshing(true);
+    else setLoading(true);
     setError("");
     try {
       const params = new URLSearchParams({
@@ -1273,13 +1400,19 @@ export default function App() {
         }>(`/prs?${params}`),
         request<Metrics>("/metrics"),
       ]);
+      if (requestId !== dashboardRequestId.current) return;
       setPrs(list.items);
       setTotal(list.total);
       setMetrics(currentMetrics);
+      setLastUpdated(new Date());
     } catch (loadError) {
+      if (requestId !== dashboardRequestId.current) return;
       setError(loadError instanceof Error ? loadError.message : "Unable to load");
     } finally {
-      setLoading(false);
+      if (requestId === dashboardRequestId.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [activeSearch, page, pageSize, request, token]);
 
@@ -1289,9 +1422,12 @@ export default function App() {
 
   useEffect(() => {
     if (!token || view !== "dashboard") return;
-    const timer = window.setInterval(() => void loadDashboard(), 60_000);
+    const timer = window.setInterval(
+      () => void loadDashboard({ background: true }),
+      60_000,
+    );
     return () => window.clearInterval(timer);
-  }, [loadDashboard, token, view]);
+  }, [loadDashboard, token, view, lastUpdated]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const rangeStart = total === 0 ? 0 : (page - 1) * pageSize + 1;
@@ -1306,11 +1442,26 @@ export default function App() {
 
   const openDetail = async (prId: number) => {
     setError("");
+    openingPrIdRef.current = prId;
+    setOpeningPrId(prId);
     try {
-      setDetail(await request<PullRequestDetail>(`/prs/${prId}`));
+      const next = await request<PullRequestDetail>(`/prs/${prId}`);
+      if (openingPrIdRef.current === prId) setDetail(next);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Unable to load");
+      if (openingPrIdRef.current === prId) {
+        setError(loadError instanceof Error ? loadError.message : "Unable to load");
+      }
+    } finally {
+      if (openingPrIdRef.current === prId) {
+        openingPrIdRef.current = null;
+        setOpeningPrId(null);
+      }
     }
+  };
+
+  const cancelOpenDetail = () => {
+    openingPrIdRef.current = null;
+    setOpeningPrId(null);
   };
 
   const refreshDetail = useCallback(
@@ -1341,7 +1492,7 @@ export default function App() {
         if (nextStatus && !["PENDING", "ATTEMPTING"].includes(nextStatus)) {
           if (!cancelled) {
             setReviewingPrId(null);
-            void loadDashboard();
+            void loadDashboard({ background: true });
           }
         }
       } catch {
@@ -1389,7 +1540,7 @@ export default function App() {
     setError("");
     try {
       await request("/prs/fetch", { method: "POST" });
-      await loadDashboard();
+      await loadDashboard({ background: true });
     } catch (fetchError) {
       setError(
         fetchError instanceof Error ? fetchError.message : "Unable to fetch pull requests",
@@ -1435,7 +1586,7 @@ export default function App() {
               }`}
               onClick={() => {
                 setView("dashboard");
-                void loadDashboard();
+                void loadDashboard({ background: true });
               }}
             >
               Pull requests
@@ -1466,14 +1617,15 @@ export default function App() {
           {view === "dashboard" && (
             <>
           <button
-            className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-50"
             disabled={fetching}
             onClick={() => void fetchPrs()}
           >
+            {fetching && <Spinner />}
             {fetching ? "Fetching…" : "Fetch PRs"}
           </button>
           <button
-            className={`rounded-lg px-3.5 py-2 text-sm font-semibold shadow-sm transition disabled:opacity-50 ${
+            className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold shadow-sm transition disabled:opacity-50 ${
               metrics?.auto_pr_review_enabled
                 ? "bg-emerald-600 text-white hover:bg-emerald-700"
                 : "bg-slate-100 text-slate-600 hover:bg-slate-200"
@@ -1481,6 +1633,7 @@ export default function App() {
             disabled={!metrics || togglingAuto}
             onClick={() => void toggleAutoReview()}
           >
+            {togglingAuto && <Spinner />}
             {togglingAuto
               ? "Updating…"
               : metrics?.auto_pr_review_enabled
@@ -1549,9 +1702,13 @@ export default function App() {
             <p className="text-xs font-medium text-slate-500">
               {label}
             </p>
-            <p className="mt-2 break-words text-2xl font-semibold tracking-tight text-slate-950">
-              {value}
-            </p>
+            {loading && !metrics ? (
+              <Skeleton className="mt-3 h-7 w-40" />
+            ) : (
+              <p className="mt-2 break-words text-2xl font-semibold tracking-tight text-slate-950">
+                {value}
+              </p>
+            )}
           </div>
         ))}
       </section>
@@ -1570,8 +1727,20 @@ export default function App() {
           </div>
           <p className="mt-0.5 text-xs text-slate-500">
             Created by you or assigned for your review
+            {lastUpdated &&
+              ` · Updated ${lastUpdated.toLocaleTimeString(undefined, { hour12: false })}, refreshes every minute`}
           </p>
         </div>
+        <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-50"
+          disabled={loading || refreshing}
+          onClick={() => void loadDashboard({ background: true })}
+        >
+          {refreshing && <Spinner />}
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
         <form className="flex" onSubmit={submitSearch}>
           <label className="sr-only" htmlFor="search">
             Search pull requests
@@ -1587,6 +1756,7 @@ export default function App() {
             Search
           </button>
         </form>
+        </div>
       </div>
 
       {error && (
@@ -1608,7 +1778,32 @@ export default function App() {
             </tr>
           </thead>
           <tbody>
-            {groupPrsByMonth(prs).map((group) => (
+            {loading && Array.from({ length: 8 }, (_, index) => (
+              <tr key={`skeleton-${index}`}>
+                <td className="px-4 py-4">
+                  <Skeleton className="h-3 w-6" />
+                </td>
+                <td className="px-5 py-4">
+                  <div className="flex items-center gap-3">
+                    <Skeleton className="h-9 w-9 shrink-0 rounded-xl" />
+                    <Skeleton className="h-4 w-64" />
+                  </div>
+                </td>
+                <td className="px-4 py-4">
+                  <Skeleton className="h-5 w-24" />
+                </td>
+                <td className="px-4 py-4">
+                  <Skeleton className="h-4 w-28" />
+                </td>
+                <td className="px-4 py-4">
+                  <Skeleton className="h-5 w-20" />
+                </td>
+                <td className="px-5 py-4">
+                  <Skeleton className="h-3 w-32" />
+                </td>
+              </tr>
+            ))}
+            {!loading && groupPrsByMonth(prs).map((group) => (
               <Fragment key={group.label}>
                 <tr>
                   <td
@@ -1679,9 +1874,6 @@ export default function App() {
             No pull requests found.
           </p>
         )}
-        {loading && (
-          <p className="p-10 text-center text-sm text-slate-500">Loading…</p>
-        )}
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-5 py-3.5">
@@ -1740,6 +1932,10 @@ export default function App() {
       </>
       )}
 
+      {!detail && openingPrId != null && (
+        <DetailSkeleton onClose={cancelOpenDetail} />
+      )}
+
       {detail && (
         <ReviewDetail
           detail={detail}
@@ -1757,7 +1953,7 @@ export default function App() {
               await request(`/prs/${detail.pr_id}/re-review`, { method: "POST" });
               setReviewingPrId(detail.pr_id);
               await refreshDetail(detail.pr_id);
-              void loadDashboard();
+              void loadDashboard({ background: true });
             } catch (queueError) {
               setError(
                 queueError instanceof Error ? queueError.message : "Unable to queue",
